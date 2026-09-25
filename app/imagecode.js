@@ -437,12 +437,25 @@
     return best;
   }
 
-  // Flat colours when the picture is mostly flat colour (few colours cover it well), otherwise the JPEG codec.
+  const decodeImage = (im) => (im.codec === 3 ? decodeFlat3(im) : im.codec === 2 ? decodeFlat(im) : decodeDCT(im));
+  // How far a decoded picture is from the original, both seen at 256 px wide.
+  function distance(img, coded) {
+    const im = decodeImage(coded), w = 256, h = Math.max(8, Math.round((w * im.height) / im.width)), src = pixelsAt(img, w, h);
+    const t = document.createElement('canvas'); t.width = im.width; t.height = im.height; t.getContext('2d').putImageData(im, 0, 0);
+    const got = pixelsAt(t, w, h);
+    let e = 0; for (let i = 0; i < src.length; i += 4) e += (src[i] - got[i]) ** 2 + (src[i + 1] - got[i + 1]) ** 2 + (src[i + 2] - got[i + 2]) ** 2;
+    return e / (w * h * 3);
+  }
+  // Photos use the JPEG-style codec. A picture that looks like flat colour is
+  // encoded both ways and keeps whichever comes out closer to the original:
+  // drawings and lettering come out sharper as flat colour, gradients as JPEG.
   function encodeImage(img, bits) {
     const aspect = clamp(img.width / img.height, 0.4, 2.5), W = 96, H = clamp(Math.round(W / aspect), 8, 255);
-    return palettize(pixelsAt(img, W, H), W * H).mse < FLAT_MSE ? encodeFlat3(img, bits) : encodeDCT(img, bits);
+    const dct = encodeDCT(img, bits);
+    if (palettize(pixelsAt(img, W, H), W * H).mse >= FLAT_MSE) return dct;
+    const flat = encodeFlat3(img, bits);
+    return distance(img, flat) <= distance(img, dct) ? flat : dct;
   }
-  const decodeImage = (im) => (im.codec === 3 ? decodeFlat3(im) : im.codec === 2 ? decodeFlat(im) : decodeDCT(im));
 
   // ---------- code ----------
   function header(img) {
