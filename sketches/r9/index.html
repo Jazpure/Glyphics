@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glyphics — round 9</title>
+  <link rel="stylesheet" href="../gallery.css">
+</head>
+<body>
+  <header>
+    <div>
+      <nav><a href="../">sketches</a> / round 9</nav>
+      <h1>Glyphics — round 9</h1>
+      <p>From the oval to a rectangle of small icons, after Jasper’s reference sheet: square cells on black, one flat geometric icon in each, built from circles, diamonds, clovers, lobed flowers and dots. It runs from close to the reference, through variations, to surprises. The switch redraws every sheet in the reference colours or in primaries only.</p>
+    </div>
+    <div class="controls">
+      <div class="modes"><button data-mode="mix" class="on">Reference colours</button><button data-mode="primary">Primaries</button></div>
+      <button id="all">Redraw all</button>
+    </div>
+  </header>
+  <main id="grid"></main>
+  <div id="lb">
+    <canvas id="big"></canvas>
+    <div class="bar">
+      <button class="prev">←</button><span id="lbt"></span><button class="next">→</button>
+      <button class="redraw">Redraw (R)</button><button class="save">PNG</button><button class="close">Close (Esc)</button>
+    </div>
+  </div>
+  <script src="../lib.js"></script>
+  <script src="tiles.js"></script>
+  <script src="directions.js"></script>
+  <script src="../gallery.js"></script>
+</body>
+</html>
