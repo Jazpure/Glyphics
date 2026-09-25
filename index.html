@@ -20,6 +20,11 @@
     .about { position: relative; max-width: 640px; margin: 0 auto; padding: 80px 24px 110px; }
     .about p { margin: 0 0 1.1em; }
     .about .placeholder { color: #aaa; }
+    /* The way back to jasper-curtis.com: Jasper's cow, small and faint until reached for. */
+    .home { position: fixed; top: calc(18px + env(safe-area-inset-top)); right: 20px; z-index: 5; display: block; opacity: 0.4; }
+    .home img { display: block; width: 24px; height: auto; }
+    .home:hover, .home:focus-visible { opacity: 0.9; transform: rotate(-8deg); }
+    @media (prefers-reduced-motion: no-preference) { .home { transition: opacity 0.2s ease, transform 0.2s ease; } }
   </style>
 </head>
 <body>
@@ -32,6 +37,7 @@
     </div>
     <a class="down" href="#about" aria-label="About">↓</a>
   </section>
+  <a class="home" href="https://jasper-curtis.com/" aria-label="Jasper Curtis"><img src="cow.png" alt=""></a>
 
   <section class="about" id="about">
     <!-- Your writing about Glyphics goes here: why you made it and how it
