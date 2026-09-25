@@ -15,106 +15,127 @@
     .tabs button { flex: 1; }
     button, .file { font: 15px system-ui, sans-serif; padding: 12px 16px; border: 0; border-radius: 4px; background: transparent; color: #fff; box-shadow: inset 0 0 0 1px #fff; cursor: pointer; text-align: center; }
     button.on, .primary { background: #fff; color: #000; box-shadow: none; }
+    button:disabled { opacity: 0.5; cursor: default; }
     .file input { display: none; }
-    input[type=text] { font: 16px system-ui, sans-serif; padding: 12px; border: 0; border-radius: 4px; width: 100%; }
-    canvas { display: block; width: 100%; aspect-ratio: 4 / 3; background: #fff; border-radius: 4px; }
+    input[type=text] { font: 16px system-ui, sans-serif; padding: 12px; border: 0; border-radius: 4px; width: 100%; min-width: 0; }
+    canvas { display: block; width: 100%; height: auto; background: #fff; border-radius: 4px; }
+    #status { font: 14px ui-monospace, "SF Mono", Menlo, monospace; color: #bbb; min-height: 1.4em; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
     .row > * { flex: 1; }
+    #tab-link { display: flex; gap: 8px; }
+    #tab-link input { flex: 1; }
     [hidden] { display: none !important; }
   </style>
 </head>
 <body>
   <header><a href="../"><b>Glyphics</b></a><a href="../scan/">Scan</a></header>
   <main>
-    <div class="tabs"><button data-tab="link" class="on">Link</button><button data-tab="image">Image</button></div>
+    <div class="tabs"><button data-tab="image" class="on">Image</button><button data-tab="link">Link</button></div>
 
-    <div id="tab-link"><input id="url" type="text" placeholder="Link" autocomplete="off" spellcheck="false" inputmode="url"></div>
-    <div id="tab-image" class="row" hidden>
+    <div id="tab-image" class="row">
       <label class="file primary">Take photo<input id="shoot" type="file" accept="image/*" capture="environment"></label>
       <label class="file">Choose image<input id="pick" type="file" accept="image/*"></label>
     </div>
+    <form id="tab-link" hidden><input id="url" type="text" placeholder="Link" autocomplete="off" spellcheck="false" inputmode="url"><button class="primary" id="go">Make</button></form>
 
+    <div id="status"></div>
     <canvas id="code" aria-label="Code" hidden></canvas>
 
     <div class="row" id="actions" hidden>
       <button id="reseed">New design</button>
+      <button id="share" hidden>Share</button>
       <button id="png">Download</button>
-      <button id="save" data-mode="link">Save</button>
     </div>
   </main>
 
-  <script src="../sketches/lib.js?v=20260925g"></script>
-  <script src="../sketches/kit.js?v=20260925g"></script>
-  <script src="../sketches/r8/code.js?v=20260925g"></script>
-  <script src="glyph.js?v=20260925g"></script>
-  <script src="rs.js?v=20260925g"></script>
-  <script src="imagecode.js?v=20260925g"></script>
+  <script src="../sketches/lib.js?v=20260925h"></script>
+  <script src="../sketches/r9/tiles.js?v=20260925h"></script>
+  <script src="rs.js?v=20260925h"></script>
+  <script src="tilecode.js?v=20260925h"></script>
   <script>
-    const $ = (id) => document.getElementById(id);
-    // Image codes use the densest lattice: most are shared as files, where more beads mean a sharper picture.
-    const canvas = $('code'), KEY = 'glyphics.registry.v1', PITCH = 7;
-    let tab = location.hash === '#image' ? 'image' : 'link', link = null, picture = null, variant = 0, remote = {};
+    const $ = (id) => document.getElementById(id), canvas = $('code');
+    // The code carries only an ID; what it points to is kept on the site.
+    let tab = location.hash === '#link' ? 'link' : 'image', code = null, variant = 0;
+    const say = (t) => { $('status').textContent = t; };
 
-    const readLocal = () => { try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; } };
-    fetch('../codes.json').then((r) => (r.ok ? r.json() : { codes: {} })).catch(() => ({ codes: {} })).then((db) => { remote = db.codes || {}; if (tab === 'link') update(); });
-
-    // Draw the current code into any canvas at a given CSS width.
-    function paint(target, cssW, dpr) {
-      const pw = Math.round(cssW * dpr), k = pw / GL.W;
-      target.width = pw; target.height = Math.round(pw * 0.75);
+    // Draw the current code into a canvas, pw pixels wide.
+    function paint(target, pw) {
+      const k = pw / TILECODE.CW; target.width = pw; target.height = Math.round(TILECODE.CH * k);
       const ctx = target.getContext('2d'); ctx.setTransform(k, 0, 0, k, 0, 0);
-      if (tab === 'link') GLYPH.draw(ctx, { id: link.id, seed: (link.seed ^ Math.imul(variant, 0x9e3779b1)) >>> 0, params: link.params });
-      else IMAGECODE.draw(ctx, picture, variant + 1);
+      TILECODE.draw(ctx, { id: code.id, seed: (code.seed + Math.imul(variant, 0x9e3779b1)) >>> 0 });
     }
     function render() {
-      const ready = tab === 'link' ? !!link : !!picture;
-      canvas.hidden = !ready; $('actions').hidden = !ready; $('save').hidden = tab !== 'link';
-      if (ready) paint(canvas, canvas.clientWidth || 800, Math.min(2, devicePixelRatio || 1));
+      canvas.hidden = !code; $('actions').hidden = !code;
+      if (code) paint(canvas, Math.round((canvas.clientWidth || 800) * Math.min(2, devicePixelRatio || 1)));
     }
-    function update() {
-      if (tab === 'link') {
-        const u = GLYPH.normaliseUrl($('url').value);
-        if (u) { const c = GLYPH.fromUrl(u); link = { ...c, url: u.href, id: GLYPH.idFor(c.key, { ...remote, ...readLocal() }) }; }
-        else link = null;
-        $('save').textContent = link && readLocal()[link.id]?.key === link.key ? 'Saved' : 'Save';
-      }
-      render();
+    async function store(body, type) {
+      const r = await fetch('../api/codes', { method: 'POST', headers: { 'Content-Type': type }, body }).catch(() => null);
+      const j = r && (r.headers.get('Content-Type') || '').includes('json') ? await r.json().catch(() => null) : null;
+      if (r && r.ok && j && /^[0-9a-f]{16}$/.test(j.id)) return j.id;
+      throw new Error(r && r.status === 413 ? 'Image too large' : r && r.status !== 404 && r.status !== 503 ? 'Upload failed' : 'Not available');
+    }
+    async function make(body, type) {
+      code = null; render(); say(type === 'application/json' ? 'Saving…' : 'Uploading…');
+      try {
+        const id = await store(body, type);
+        code = { id, seed: crypto.getRandomValues(new Uint32Array(1))[0] }; variant = 0; say(''); render();
+      } catch (e) { say(e.message); }
     }
 
-    document.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
-      tab = b.dataset.tab; variant = 0;
-      document.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('on', x === b));
-      $('tab-link').hidden = tab !== 'link'; $('tab-image').hidden = tab !== 'image';
-      history.replaceState(null, '', tab === 'image' ? '#image' : location.pathname);
-      update();
-    }));
-    let timer;
-    $('url').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { variant = 0; update(); }, 180); });
-
-    // A photo becomes an image code: the picture itself lives in the beads.
-    function takePicture(file) {
-      if (!file || !file.type.startsWith('image/')) return;
+    // A picture is stored at up to 2048 px on its long side, as a JPEG.
+    function takePicture(input) {
+      const file = input.files[0]; input.value = '';
+      if (!file) return;
       const url = URL.createObjectURL(file), img = new Image();
-      img.onload = () => { picture = IMAGECODE.encode(img, PITCH); URL.revokeObjectURL(url); variant = 0; render(); };
+      img.onerror = () => { URL.revokeObjectURL(url); say('Couldn’t open image'); };
+      img.onload = () => {
+        const s = Math.min(1, 2048 / Math.max(img.width, img.height)), c = document.createElement('canvas');
+        c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+        const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        c.toBlob((blob) => (blob ? make(blob, 'image/jpeg') : say('Couldn’t open image')), 'image/jpeg', 0.88);
+      };
       img.src = url;
     }
-    $('shoot').addEventListener('change', (e) => takePicture(e.target.files[0]));
-    $('pick').addEventListener('change', (e) => takePicture(e.target.files[0]));
+    $('shoot').addEventListener('change', (e) => takePicture(e.target));
+    $('pick').addEventListener('change', (e) => takePicture(e.target));
+
+    // A link: add https:// when it is left off.
+    $('tab-link').addEventListener('submit', (e) => {
+      e.preventDefault();
+      let v = $('url').value.trim(); if (!v) return;
+      if (!/^[a-z][a-z0-9+.-]*:/i.test(v)) v = 'https://' + v;
+      let u; try { u = new URL(v); } catch { say('Invalid link'); return; }
+      if (!/^https?:$/.test(u.protocol) || !u.hostname.includes('.')) { say('Invalid link'); return; }
+      make(JSON.stringify({ url: u.href }), 'application/json');
+    });
+
+    document.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
+      tab = b.dataset.tab;
+      document.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('on', x === b));
+      $('tab-link').hidden = tab !== 'link'; $('tab-image').hidden = tab !== 'image';
+      history.replaceState(null, '', tab === 'link' ? '#link' : location.pathname);
+      code = null; say(''); render();
+    }));
 
     $('reseed').addEventListener('click', () => { variant++; render(); });
-    $('png').addEventListener('click', () => {
-      const out = document.createElement('canvas'); paint(out, 2400, 1);
-      const a = document.createElement('a'); a.download = `glyphics-${tab === 'link' ? link.id : 'image'}-${variant}.png`; a.href = out.toDataURL('image/png'); a.click();
+    const pngBlob = () => new Promise((res) => { const out = document.createElement('canvas'); paint(out, 2400); out.toBlob(res, 'image/png'); });
+    const fileName = () => `glyphics-${code.id}-${variant}.png`;
+    $('png').addEventListener('click', async () => {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(await pngBlob()); a.download = fileName(); a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
     });
-    $('save').addEventListener('click', () => {
-      if (!link) return;
-      const reg = readLocal();
-      reg[link.id] = { key: link.key, type: 'url', url: link.url, created: Date.now() };
-      try { localStorage.setItem(KEY, JSON.stringify(reg)); $('save').textContent = 'Saved'; } catch { $('save').textContent = 'Save failed'; }
+    // Phones can send the code straight from here.
+    const canShareFiles = !!(navigator.canShare && navigator.canShare({ files: [new File([''], 'x.png', { type: 'image/png' })] }));
+    $('share').hidden = !canShareFiles;
+    $('share').addEventListener('click', async () => {
+      const file = new File([await pngBlob()], fileName(), { type: 'image/png' });
+      try { await navigator.share({ files: [file] }); } catch {}
     });
 
+    let timer;
     addEventListener('resize', () => { clearTimeout(timer); timer = setTimeout(render, 150); });
-    if (tab === 'image') document.querySelector('[data-tab=image]').click(); else update();
+    if (tab === 'link') document.querySelector('[data-tab=link]').click();
   </script>
 </body>
 </html>

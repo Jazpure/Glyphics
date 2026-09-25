@@ -49,12 +49,14 @@
     <div class="row" id="rActions"></div>
   </div>
 
-  <script src="../sketches/lib.js?v=20260925g"></script>
-  <script src="../sketches/kit.js?v=20260925g"></script>
-  <script src="../sketches/r8/code.js?v=20260925g"></script>
-  <script src="../app/rs.js?v=20260925g"></script>
-  <script src="../app/imagecode.js?v=20260925g"></script>
-  <script src="scan.js?v=20260925g"></script>
+  <script src="../sketches/lib.js?v=20260925h"></script>
+  <script src="../sketches/kit.js?v=20260925h"></script>
+  <script src="../sketches/r8/code.js?v=20260925h"></script>
+  <script src="../app/rs.js?v=20260925h"></script>
+  <script src="../app/imagecode.js?v=20260925h"></script>
+  <script src="../sketches/r9/tiles.js?v=20260925h"></script>
+  <script src="../app/tilecode.js?v=20260925h"></script>
+  <script src="scan.js?v=20260925h"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const video = $('video'), overlay = $('overlay'), grab = document.createElement('canvas'), gx = grab.getContext('2d', { willReadFrequently: true });
@@ -87,6 +89,10 @@
     const say = (t) => { $('status').textContent = t; };
 
     const lookup = async (id) => {
+      if (typeof id === 'string') {
+        const r = await fetch('../api/codes/' + id).catch(() => null);
+        if (r && r.ok && (r.headers.get('Content-Type') || '').includes('json')) { const e = await r.json().catch(() => null); if (e && e.type) return e; }
+      }
       if (!remote) remote = await fetch('../codes.json').then((r) => (r.ok ? r.json() : { codes: {} })).catch(() => ({ codes: {} }));
       let local = {}; try { local = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch {}
       return (remote.codes || {})[id] || local[id] || null;
@@ -113,8 +119,19 @@
             target.textContent = u.href;
             actions.append(button('Open', () => { location.href = u.href; }));
           } else target.textContent = 'Invalid link';
-        } else if (e.type === 'image' && e.image?.startsWith('data:image/')) {
-          const img = new Image(); img.src = e.image; img.alt = e.name || 'Shared image'; target.append(img);
+        } else if (e.type === 'image' && (e.src || e.image?.startsWith('data:image/'))) {
+          const src = e.src ? new URL(e.src, location.href).href : e.image, img = new Image();
+          img.alt = 'Image'; target.append(img);
+          img.onerror = () => { target.textContent = 'Not available'; };
+          img.src = src;
+          actions.append(button('Save', async () => {
+            const blob = await fetch(src).then((r) => r.blob()), name = 'glyphics-' + (typeof hit.id === 'string' ? hit.id : 'image') + '.' + (blob.type.split('/')[1] || 'jpg');
+            // Phones: the share sheet, which offers saving to photos.
+            const file = new File([blob], name, { type: blob.type });
+            if (navigator.canShare && navigator.canShare({ files: [file] })) { try { await navigator.share({ files: [file] }); return; } catch (err) { if (err.name === 'AbortError') return; } }
+            const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+          }));
         } else target.textContent = 'Not available';
       }
       actions.append(button('Scan again', () => { done = false; reader.reset(); $('result').classList.remove('on'); drawOverlay(null); start(); }, true));
@@ -177,14 +194,16 @@
     }
 
     // Outline of what the scanner sees, on top of the video (object-fit: cover).
-    function drawOverlay(E, W, H, locked) {
+    function drawOverlay(r0, W, H, locked) {
       const r = overlay.getBoundingClientRect(), dpr = devicePixelRatio || 1;
       overlay.width = r.width * dpr; overlay.height = r.height * dpr;
       const x = overlay.getContext('2d'); x.clearRect(0, 0, overlay.width, overlay.height);
-      if (!E) return;
+      if (!r0 || (!r0.E && !r0.sheet)) return;
       const s = Math.max(overlay.width / W, overlay.height / H), ox = (overlay.width - W * s) / 2, oy = (overlay.height - H * s) / 2;
-      x.strokeStyle = locked ? '#3ddc84' : '#ffffff'; x.lineWidth = 3 * dpr;
-      x.beginPath(); x.ellipse(ox + E.cx * s, oy + E.cy * s, E.a * s, E.b * s, E.theta, 0, Math.PI * 2); x.stroke();
+      x.strokeStyle = locked ? '#3ddc84' : '#ffffff'; x.lineWidth = 3 * dpr; x.lineJoin = 'round'; x.beginPath();
+      if (r0.sheet) r0.sheet.corners.forEach(([px, py], i) => (i ? x.lineTo(ox + px * s, oy + py * s) : x.moveTo(ox + px * s, oy + py * s)));
+      else { const E = r0.E; x.ellipse(ox + E.cx * s, oy + E.cy * s, E.a * s, E.b * s, E.theta, 0, Math.PI * 2); }
+      x.closePath(); x.stroke();
     }
 
     // Frames go to the reader at up to 2560 px on the long side (sharp enough for
@@ -199,7 +218,7 @@
         reader.read(gx.getImageData(0, 0, W, H).data.buffer, W, H, { opts: { tryImage: true, pitches: [7, 10], steady: 1 } }).then((r) => {
           busy = false;
           if (done || !running) return;
-          drawOverlay(r.E, W, H, !!r.kind);
+          drawOverlay(r, W, H, !!r.kind);
           if (r.kind) show(r); else if (r.found) say('Reading…'); else if ($('status').textContent === 'Reading…') say('');
         });
       }
@@ -263,7 +282,11 @@
       const q = new URLSearchParams(location.search), id = Number(q.get('id') || 271828);
       const code = document.createElement('canvas'); code.width = 2400; code.height = 1800;
       const cx = code.getContext('2d'); cx.setTransform(2, 0, 0, 2, 0, 0);
-      if (q.get('test') === 'image') {
+      if (q.get('test') === 'tile') {
+        const k = 2400 / TILECODE.CW; cx.setTransform(k, 0, 0, k, 0, (1800 - TILECODE.CH * k) / 2);
+        cx.fillStyle = '#fff'; cx.fillRect(0, -500, 1200, 2000);
+        TILECODE.draw(cx, { id: q.get('id') || '0123456789abcdef', seed: 5 });
+      } else if (q.get('test') === 'image') {
         const pic = document.createElement('canvas'); pic.width = 320; pic.height = 240; const p = pic.getContext('2d');
         const g = p.createLinearGradient(0, 0, 0, 240); g.addColorStop(0, '#2f6fd8'); g.addColorStop(1, '#e8743b'); p.fillStyle = g; p.fillRect(0, 0, 320, 240);
         p.fillStyle = '#fff3c4'; p.beginPath(); p.arc(220, 80, 36, 0, 7); p.fill(); p.fillStyle = '#2d5a27'; p.fillRect(0, 180, 320, 60);

@@ -461,16 +461,214 @@
     };
   }
 
+  // ---------- tile codes (the Free Scale sheet) ----------
+  // Luminance, bilinear, from a plane worked out once per frame.
+  let lumOf = null, lumPlane = null;
+  function lum(frame, W, H, x, y) {
+    if (lumOf !== frame) {
+      lumPlane = new Uint8Array(W * H);
+      for (let i = 0, o = 0; i < W * H; i++, o += 4) lumPlane[i] = (77 * frame[o] + 151 * frame[o + 1] + 28 * frame[o + 2]) >> 8;
+      lumOf = frame;
+    }
+    if (x < 0 || y < 0 || x >= W - 1 || y >= H - 1) return 255;
+    const X = x | 0, Y = y | 0, fx = x - X, fy = y - Y, o = Y * W + X, P = lumPlane;
+    const a = P[o] + (P[o + 1] - P[o]) * fx, b = P[o + W] + (P[o + W + 1] - P[o + W]) * fx;
+    return a + (b - a) * fy;
+  }
+  // Find the sheet: a region of ink (dark or strongly coloured pixels) held
+  // together by the dot grid, roughly a rectangle. Returns its four corners
+  // (long side first) in frame pixels.
+  function tileFind(frame, W, H) {
+    const DH = Math.round((DW * H) / W), sx = W / DW, m = new Uint8Array(DW * DH);
+    // Any ink in a block marks it, so the dots' thin outlines are not missed.
+    // Dark means clearly darker than the page's own white (a warm or dim page
+    // still counts as white).
+    const lo = new Uint8Array(DW * DH).fill(255), hi = new Uint8Array(DW * DH);
+    for (let y = 0; y < H; y++) {
+      const row = Math.min(DH - 1, (y / sx) | 0) * DW;
+      for (let x = 0, o = y * W * 4; x < W; x++, o += 4) {
+        const R = frame[o], G = frame[o + 1], B = frame[o + 2], mx = R > G ? (R > B ? R : B) : G > B ? G : B, mn = R < G ? (R < B ? R : B) : G < B ? G : B, q = row + Math.min(DW - 1, (x / sx) | 0);
+        if (mx < lo[q]) lo[q] = mx; if (mx > hi[q]) hi[q] = mx;
+        if (mx > 60 && mx - mn > mx * 0.4) m[q] = 1;
+      }
+    }
+    const sorted = hi.slice().sort(), paper = sorted[Math.floor(sorted.length * 0.9)];
+    for (let q = 0; q < m.length; q++) if (lo[q] < paper * 0.8) m[q] = 1;
+    // Frame edges are often dark (lens falloff, black bars): ignore a thin band.
+    for (let j = 0; j < DH; j++) for (let i = 0; i < DW; i++) if (i < 2 || j < 2 || i >= DW - 2 || j >= DH - 2) m[j * DW + i] = 0;
+    close(m, DW, DH, 7);
+    // Fill holes: white areas inside the sheet belong to it.
+    { const out = new Uint8Array(DW * DH), st = [];
+      for (let i = 0; i < DW; i++) for (const j of [0, DH - 1]) { const q = j * DW + i; if (!m[q] && !out[q]) { out[q] = 1; st.push(q); } }
+      for (let j = 0; j < DH; j++) for (const i of [0, DW - 1]) { const q = j * DW + i; if (!m[q] && !out[q]) { out[q] = 1; st.push(q); } }
+      while (st.length) { const q = st.pop(), x = q % DW, y = (q / DW) | 0; for (const k of [x > 0 ? q - 1 : -1, x < DW - 1 ? q + 1 : -1, y > 0 ? q - DW : -1, y < DH - 1 ? q + DW : -1]) if (k >= 0 && !m[k] && !out[k]) { out[k] = 1; st.push(k); } }
+      for (let q = 0; q < m.length; q++) if (!out[q]) m[q] = 1; }
+    const lab = new Int32Array(DW * DH), stack = [];
+    let best = null, next = 1;
+    for (let p = 0; p < m.length; p++) {
+      if (!m[p] || lab[p]) continue;
+      const pts = []; lab[p] = next; stack.push(p);
+      while (stack.length) {
+        const q = stack.pop(), x = q % DW, y = (q / DW) | 0; pts.push(q);
+        if (x > 0 && m[q - 1] && !lab[q - 1]) { lab[q - 1] = next; stack.push(q - 1); }
+        if (x < DW - 1 && m[q + 1] && !lab[q + 1]) { lab[q + 1] = next; stack.push(q + 1); }
+        if (y > 0 && m[q - DW] && !lab[q - DW]) { lab[q - DW] = next; stack.push(q - DW); }
+        if (y < DH - 1 && m[q + DW] && !lab[q + DW]) { lab[q + DW] = next; stack.push(q + DW); }
+      }
+      next++;
+      if (pts.length < DW * DH * 0.03 || (best && pts.length < best.length)) continue;
+      best = pts;
+    }
+    if (!best) return null;
+    // Principal axes, then the extreme point along each diagonal: the corners.
+    let mx = 0, my = 0; for (const q of best) { mx += q % DW; my += (q / DW) | 0; } mx /= best.length; my /= best.length;
+    let cxx = 0, cyy = 0, cxy = 0; for (const q of best) { const dx = (q % DW) - mx, dy = ((q / DW) | 0) - my; cxx += dx * dx; cyy += dy * dy; cxy += dx * dy; }
+    const th = 0.5 * Math.atan2(2 * cxy, cxx - cyy), c = Math.cos(th), sn = Math.sin(th);
+    let su = 0, sv = 0; for (const q of best) { const dx = (q % DW) - mx, dy = ((q / DW) | 0) - my; su = Math.max(su, Math.abs(dx * c + dy * sn)); sv = Math.max(sv, Math.abs(-dx * sn + dy * c)); }
+    const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => {
+      let bq = best[0], bs = -Infinity;
+      for (const q of best) { const dx = (q % DW) - mx, dy = ((q / DW) | 0) - my, u = (dx * c + dy * sn) / su, v = (-dx * sn + dy * c) / sv, sc = a * u + b * v; if (sc > bs) { bs = sc; bq = q; } }
+      return [((bq % DW) + 0.5) * sx, (((bq / DW) | 0) + 0.5) * sx];
+    });
+    const side = (a, b) => Math.hypot(corners[a][0] - corners[b][0], corners[a][1] - corners[b][1]);
+    const quad = Math.abs(corners.reduce((a, p, i) => { const q = corners[(i + 1) % 4]; return a + p[0] * q[1] - q[0] * p[1]; }, 0)) / 2 / (sx * sx);
+    const aspect = (side(0, 1) + side(2, 3)) / (side(1, 2) + side(3, 0));
+    // A rectangle fills the quad through its corners; an oval overfills it by half.
+    const fill = best.length / quad;
+    if (fill < 0.8 || fill > 1.2 || aspect < 1.3 || aspect > 2.6) return null;
+    return { corners, area: best.length * sx * sx };
+  }
+  // How much a spot looks like one of the grid's dots, of radius rp pixels:
+  // a dark disc on lighter ground, a light centre inside a dark ring, or a
+  // light disc on darker ground.
+  const RING = Array.from({ length: 8 }, (_, k) => [Math.cos((k / 8) * TAU), Math.sin((k / 8) * TAU)]);
+  function dotScore(frame, W, H, x, y, rp) {
+    const c = lum(frame, W, H, x, y), r1 = rp * 0.85, r2 = rp * 1.9;
+    let ring = 0, out = 0;
+    for (const [ca, sa] of RING) { ring += lum(frame, W, H, x + ca * r1, y + sa * r1); out += lum(frame, W, H, x + ca * r2, y + sa * r2); }
+    ring /= 8; out /= 8;
+    return Math.max(out - (c + ring) / 2, Math.min(c, out) - ring, c - (ring + out) / 2);
+  }
+  // Lock the dot grid. The finder's corners are only rough (the plain white
+  // dots at the edges can be too faint to count as ink), so this starts in
+  // the middle, where a rough guess is still close, and grows outward: each
+  // predicted dot moves to the best dot nearby and the perspective is refitted.
+  // Then it looks for where the dots stop, which fixes the edges exactly.
+  function tileRegister(frame, W, H, found) {
+    const T = TILECODE, g = [[0, 0], [T.NX - 1, 0], [T.NX - 1, T.NY - 1], [0, T.NY - 1]];
+    const canon = g.map(([i, j]) => { const [x, y] = T.dotXY(i, j); return [x + (i ? 1 : -1) * T.DOT_R, y + (j ? 1 : -1) * T.DOT_R]; });
+    let Hm = fitH(canon.map((p, k) => [p[0], p[1], found.corners[k][0], found.corners[k][1]]));
+    if (!Hm) return null;
+    const ci = (T.NX - 1) / 2, cj = (T.NY - 1) / 2, PAD = 5;
+    // The best dot near where (i, j) is predicted, as [x, y, score].
+    const seek = (i, j, reach, n = 4) => {
+      const cx = T.M + i * T.STEP, cy = T.M + j * T.STEP, [x, y] = applyH(Hm, cx, cy), [x2, y2] = applyH(Hm, cx + T.STEP, cy);
+      const step = Math.hypot(x2 - x, y2 - y), rp = Math.max(1, T.DOT_R * (step / T.STEP));
+      if (!reach) return [cx, cy, x, y, dotScore(frame, W, H, x, y, rp)];
+      const r = Math.max(1, reach * step), st = Math.max(0.5, r / n);
+      let bs = -Infinity, bx = x, by = y;
+      for (let dy = -r; dy <= r + 1e-6; dy += st) for (let dx = -r; dx <= r + 1e-6; dx += st) { const sc = dotScore(frame, W, H, x + dx, y + dy, rp); if (sc > bs) { bs = sc; bx = x + dx; by = y + dy; } }
+      return [cx, cy, bx, by, bs];
+    };
+    const fit = (pairs, affine) => {
+      if (pairs.length < (affine ? 12 : 30)) return false;
+      pairs.sort((a, b) => b[4] - a[4]);
+      let use = pairs.slice(0, Math.ceil(pairs.length * 0.85));
+      const f = affine ? fitA : fitH, H2 = f(use); if (!H2) return false;
+      use = use.map((p) => { const [u, v] = applyH(H2, p[0], p[1]); return [...p, Math.hypot(u - p[2], v - p[3])]; }).sort((a, b) => a[5] - b[5]).slice(0, Math.ceil(use.length * 0.85));
+      Hm = f(use) || H2; return true;
+    };
+    // How well a mapping fits the whole grid: the dot evidence at every dot.
+    const quality = () => { let t = 0; for (let j = 0; j < T.NY; j++) for (let i = 0; i < T.NX; i++) t += Math.max(0, seek(i, j, 0.06, 1)[4]); return t; };
+    // The rough start can be off by part of a step: try shifts of the whole
+    // grid across one step and keep the one where the middle dots fit best.
+    {
+      const [x0, y0] = applyH(Hm, T.M + ci * T.STEP, T.M + cj * T.STEP), [x1, y1] = applyH(Hm, T.M + (ci + 1) * T.STEP, T.M + cj * T.STEP), [x2, y2] = applyH(Hm, T.M + ci * T.STEP, T.M + (cj + 1) * T.STEP);
+      const ux = x1 - x0, uy = y1 - y0, vx = x2 - x0, vy = y2 - y0, H0 = Hm.slice();
+      let best = -Infinity, bu = 0, bv = 0;
+      for (let a = -0.5; a < 0.5; a += 0.125) for (let b = -0.5; b < 0.5; b += 0.125) {
+        const dx = a * ux + b * vx, dy = a * uy + b * vy;
+        Hm = [H0[0] + dx * H0[6], H0[1] + dx * H0[7], H0[2] + dx * H0[8], H0[3] + dy * H0[6], H0[4] + dy * H0[7], H0[5] + dy * H0[8], H0[6], H0[7], H0[8]];
+        let t = 0; for (let j = cj - 3; j <= cj + 3; j++) for (let i = ci - 5; i <= ci + 5; i++) t += Math.max(0, seek(i, j, 0)[4]);
+        if (t > best) { best = t; bu = dx; bv = dy; }
+      }
+      Hm = [H0[0] + bu * H0[6], H0[1] + bu * H0[7], H0[2] + bu * H0[8], H0[3] + bv * H0[6], H0[4] + bv * H0[7], H0[5] + bv * H0[8], H0[6], H0[7], H0[8]];
+    }
+    let q = quality();
+    for (const [rad, reach, affine] of [[4, 0.25, true], [7, 0.22, false], [11, 0.18, false], [30, 0.14, false], [30, 0.1, false]]) {
+      const pairs = [], keep = Hm;
+      for (let j = Math.ceil(cj - rad); j <= Math.floor(cj + rad); j++) for (let i = Math.ceil(ci - rad * 1.8); i <= Math.floor(ci + rad * 1.8); i++) {
+        if (i < -1 || j < -1 || i > T.NX || j > T.NY) continue;
+        const p = seek(i, j, reach); if (p[4] > 18) pairs.push(p);
+      }
+      // A step is kept only if the whole grid fits better than before.
+      if (fit(pairs, affine)) { const q2 = quality(); if (q2 > q) q = q2; else Hm = keep; }
+    }
+    // Where do the dots stop? Evidence per column and row over a padded range;
+    // the sheet is the NX × NY window holding the most.
+    const cols = new Float64Array(T.NX + 2 * PAD), rows = new Float64Array(T.NY + 2 * PAD);
+    for (let j = -PAD; j < T.NY + PAD; j++) for (let i = -PAD; i < T.NX + PAD; i++) { const sc = Math.max(0, seek(i, j, 0.06, 1)[4]); cols[i + PAD] += sc; rows[j + PAD] += sc; }
+    const window = (a, n) => { let best = 0, bs = -1; for (let o = 0; o + n <= a.length; o++) { let t = 0; for (let k = 0; k < n; k++) t += a[o + k]; if (t > bs) { bs = t; best = o; } } return best - PAD; };
+    const di = window(cols, T.NX), dj = window(rows, T.NY);
+    // Re-index so that (di, dj) becomes dot (0, 0).
+    const S = [1, 0, di * T.STEP, 0, 1, dj * T.STEP, 0, 0, 1], mul = (P, Q) => Array.from({ length: 9 }, (_, k) => P[((k / 3) | 0) * 3] * Q[k % 3] + P[((k / 3) | 0) * 3 + 1] * Q[3 + (k % 3)] + P[((k / 3) | 0) * 3 + 2] * Q[6 + (k % 3)]);
+    return { H: mul(Hm, S), shift: [di, dj] };
+  }
+  // Each dot's darkness: 255 minus the brightness of its middle.
+  function tileDarkness(frame, W, H, Hm) {
+    const T = TILECODE, dark = new Float32Array(T.NX * T.NY);
+    for (let j = 0; j < T.NY; j++) for (let i = 0; i < T.NX; i++) {
+      const [cx, cy] = T.dotXY(i, j), [x, y] = applyH(Hm, cx, cy), [x2, y2] = applyH(Hm, cx + T.STEP, cy), rp = T.DOT_R * (Math.hypot(x2 - x, y2 - y) / T.STEP) * 0.35;
+      dark[j * T.NX + i] = 255 - (lum(frame, W, H, x, y) * 2 + lum(frame, W, H, x + rp, y) + lum(frame, W, H, x - rp, y) + lum(frame, W, H, x, y + rp) + lum(frame, W, H, x, y - rp)) / 6;
+    }
+    return dark;
+  }
+  // One frame, start to finish (used for photos): the ID, or null.
+  function tileRead(frame, W, H) {
+    const found = tileFind(frame, W, H); if (!found) return null;
+    const reg = tileRegister(frame, W, H, found); if (!reg) return null;
+    const res = TILECODE.readDots(tileDarkness(frame, W, H, reg.H));
+    return res ? { ...res, found } : null;
+  }
+  // Averages dot darkness over frames, lined up for the two ways up.
+  function tileAverager() {
+    let sum = null, w = 0;
+    return {
+      reset() { sum = null; w = 0; },
+      add(dark) {
+        if (sum) {
+          const n = dark.length; let same = 0, turned = 0;
+          for (let i = 0; i < n; i++) { const m = sum[i] / w; same += (dark[i] - m) ** 2; turned += (dark[n - 1 - i] - m) ** 2; }
+          if (turned < same) dark = dark.slice().reverse();
+        } else sum = new Float32Array(dark.length);
+        for (let i = 0; i < dark.length; i++) sum[i] = sum[i] * 0.8 + dark[i];
+        w = w * 0.8 + 1;
+        return TILECODE.readDots(sum.map((v) => v / w));
+      },
+    };
+  }
+
   // ---------- a scanning session ----------
   // Feed frames; it keeps votes while the code holds still and reports once sure.
   function session() {
-    let acc = null, last = null, n = 0, gone = 0;
-    const avg = imageAverager();
+    let acc = null, last = null, n = 0, gone = 0, tileGone = 0;
+    const avg = imageAverager(), tiles = window.TILECODE ? tileAverager() : null;
     return {
-      reset() { acc = null; last = null; n = 0; avg.reset(); },
+      reset() { acc = null; last = null; n = 0; avg.reset(); tiles?.reset(); },
       frame(frame, W, H, { tryImage = false, pitches = [7], mirrors = [false], steady = 0 } = {}) {
+        // The current code: the Free Scale sheet, whose dots carry an ID.
+        const sheet = tiles && tileFind(frame, W, H);
+        if (sheet) {
+          tileGone = 0;
+          const reg = tileRegister(frame, W, H, sheet);
+          if (reg) {
+            const res = tiles.add(tileDarkness(frame, W, H, reg.H));
+            if (res) return { found: true, sheet, kind: 'tile', id: res.id };
+          }
+        } else if (tiles && ++tileGone > 8) tiles.reset();
+        // Older codes: the oval.
         const E = detect(frame, W, H);
-        if (!E) { acc = null; last = null; if (++gone > 8) avg.reset(); return { found: false }; }
+        if (!E) { acc = null; last = null; if (++gone > 8) avg.reset(); return sheet ? { found: true, sheet } : { found: false }; }
         gone = 0;
         const moved = last && (Math.hypot(E.cx - last.cx, E.cy - last.cy) > E.a * 0.06 || Math.abs(E.a - last.a) > E.a * 0.06);
         if (!acc || moved) { acc = [Array.from({ length: 48 }, () => [0, 0, 0]), Array.from({ length: 48 }, () => [0, 0, 0])]; n = 0; }
@@ -490,5 +688,5 @@
     };
   }
 
-  window.SCAN = { detect, session, imageRead, PITCHES_ALL, hueClass, _fitH: fitH, _beadBlobs: beadBlobs, _register: register, _startH: startH, _applyH: applyH, _beadColours: beadColours, _beadRGB: beadRGB, _registerAll: registerAll, _voidCentre: voidCentre, _project: project };
+  window.SCAN = { detect, session, imageRead, tileRead, _tileFind: tileFind, _tileRegister: tileRegister, _tileDarkness: tileDarkness, PITCHES_ALL, hueClass, _fitH: fitH, _beadBlobs: beadBlobs, _register: register, _startH: startH, _applyH: applyH, _beadColours: beadColours, _beadRGB: beadRGB, _registerAll: registerAll, _voidCentre: voidCentre, _project: project };
 })();

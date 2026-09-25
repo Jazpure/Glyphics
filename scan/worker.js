@@ -3,7 +3,7 @@
 // Messages out: the session's result for that frame.
 self.window = self;
 const v = self.location.search;
-importScripts(`../sketches/lib.js${v}`, `../sketches/kit.js${v}`, `../sketches/r8/code.js${v}`, `../app/rs.js${v}`, `../app/imagecode.js${v}`, `scan.js${v}`);
+importScripts(`../sketches/lib.js${v}`, `../sketches/kit.js${v}`, `../sketches/r8/code.js${v}`, `../app/rs.js${v}`, `../app/imagecode.js${v}`, `../app/tilecode.js${v}`, `scan.js${v}`);
 
 let live = SCAN.session();
 self.onmessage = ({ data: m }) => {
