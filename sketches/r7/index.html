@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glyphics — round 7</title>
+  <link rel="stylesheet" href="../gallery.css">
+</head>
+<body>
+  <header>
+    <div>
+      <nav><a href="../">sketches</a> / round 7</nav>
+      <h1>Glyphics — round 7</h1>
+      <p>Built on round 6’s Tide Radiant, Woodcut, Collage, Shadow Bloom and Halftone Bloom, with about thirty shape kinds, wider size ranges and bold designs. It runs from conservative, through fusions, to radical. The switch redraws every design in pure black and white, full colour, or a random mix.</p>
+    </div>
+    <div class="controls">
+      <div class="modes"><button data-mode="mix" class="on">Mix</button><button data-mode="mono">B/W</button><button data-mode="color">Colour</button></div>
+      <button id="all">Redraw all</button>
+    </div>
+  </header>
+  <main id="grid"></main>
+  <div id="lb">
+    <canvas id="big"></canvas>
+    <div class="bar">
+      <button class="prev">←</button><span id="lbt"></span><button class="next">→</button>
+      <button class="redraw">Redraw (R)</button><button class="save">PNG</button><button class="close">Close (Esc)</button>
+    </div>
+  </div>
+  <script src="../lib.js"></script>
+  <script src="../kit.js"></script>
+  <script src="directions.js"></script>
+  <script src="../gallery.js"></script>
+</body>
+</html>

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glyphics — make</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0a0a0a; color: #fff; font: 16px/1.45 system-ui, -apple-system, sans-serif; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; max-width: 900px; margin: 0 auto; }
+    header a { color: #fff; text-decoration: none; }
+    header b { font-size: 18px; }
+    main { max-width: 900px; margin: 0 auto; padding: 0 16px 32px; display: flex; flex-direction: column; gap: 12px; }
+    .tabs { display: flex; gap: 8px; }
+    .tabs button { flex: 1; }
+    button, .file { font: 15px system-ui, sans-serif; padding: 12px 16px; border: 0; border-radius: 4px; background: transparent; color: #fff; box-shadow: inset 0 0 0 1px #fff; cursor: pointer; text-align: center; }
+    button.on, .primary { background: #fff; color: #000; box-shadow: none; }
+    .file input { display: none; }
+    input[type=text] { font: 16px system-ui, sans-serif; padding: 12px; border: 0; border-radius: 4px; width: 100%; }
+    canvas { display: block; width: 100%; aspect-ratio: 4 / 3; background: #fff; border-radius: 4px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .row > * { flex: 1; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <header><a href="../"><b>Glyphics</b></a><a href="../scan/">Scan</a></header>
+  <main>
+    <div class="tabs"><button data-tab="link" class="on">Link</button><button data-tab="image">Image</button></div>
+
+    <div id="tab-link"><input id="url" type="text" placeholder="Link" autocomplete="off" spellcheck="false" inputmode="url"></div>
+    <div id="tab-image" class="row" hidden>
+      <label class="file primary">Take photo<input id="shoot" type="file" accept="image/*" capture="environment"></label>
+      <label class="file">Choose image<input id="pick" type="file" accept="image/*"></label>
+    </div>
+
+    <canvas id="code" aria-label="Code" hidden></canvas>
+
+    <div class="row" id="actions" hidden>
+      <button id="reseed">New design</button>
+      <button id="png">Download</button>
+      <button id="save" data-mode="link">Save</button>
+    </div>
+  </main>
+
+  <script src="../sketches/lib.js"></script>
+  <script src="../sketches/kit.js"></script>
+  <script src="../sketches/r8/code.js"></script>
+  <script src="glyph.js"></script>
+  <script src="rs.js"></script>
+  <script src="imagecode.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const canvas = $('code'), KEY = 'glyphics.registry.v1', PITCH = 10;
+    let tab = location.hash === '#image' ? 'image' : 'link', link = null, picture = null, variant = 0, remote = {};
+
+    const readLocal = () => { try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; } };
+    fetch('../codes.json').then((r) => (r.ok ? r.json() : { codes: {} })).catch(() => ({ codes: {} })).then((db) => { remote = db.codes || {}; if (tab === 'link') update(); });
+
+    // Draw the current code into any canvas at a given CSS width.
+    function paint(target, cssW, dpr) {
+      const pw = Math.round(cssW * dpr), k = pw / GL.W;
+      target.width = pw; target.height = Math.round(pw * 0.75);
+      const ctx = target.getContext('2d'); ctx.setTransform(k, 0, 0, k, 0, 0);
+      if (tab === 'link') GLYPH.draw(ctx, { id: link.id, seed: (link.seed ^ Math.imul(variant, 0x9e3779b1)) >>> 0, params: link.params });
+      else IMAGECODE.draw(ctx, picture, variant + 1);
+    }
+    function render() {
+      const ready = tab === 'link' ? !!link : !!picture;
+      canvas.hidden = !ready; $('actions').hidden = !ready; $('save').hidden = tab !== 'link';
+      if (ready) paint(canvas, canvas.clientWidth || 800, Math.min(2, devicePixelRatio || 1));
+    }
+    function update() {
+      if (tab === 'link') {
+        const u = GLYPH.normaliseUrl($('url').value);
+        if (u) { const c = GLYPH.fromUrl(u); link = { ...c, url: u.href, id: GLYPH.idFor(c.key, { ...remote, ...readLocal() }) }; }
+        else link = null;
+        $('save').textContent = link && readLocal()[link.id]?.key === link.key ? 'Saved' : 'Save';
+      }
+      render();
+    }
+
+    document.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
+      tab = b.dataset.tab; variant = 0;
+      document.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('on', x === b));
+      $('tab-link').hidden = tab !== 'link'; $('tab-image').hidden = tab !== 'image';
+      history.replaceState(null, '', tab === 'image' ? '#image' : location.pathname);
+      update();
+    }));
+    let timer;
+    $('url').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { variant = 0; update(); }, 180); });
+
+    // A photo becomes an image code: the picture itself lives in the beads.
+    function takePicture(file) {
+      if (!file || !file.type.startsWith('image/')) return;
+      const url = URL.createObjectURL(file), img = new Image();
+      img.onload = () => { picture = IMAGECODE.encode(img, PITCH); URL.revokeObjectURL(url); variant = 0; render(); };
+      img.src = url;
+    }
+    $('shoot').addEventListener('change', (e) => takePicture(e.target.files[0]));
+    $('pick').addEventListener('change', (e) => takePicture(e.target.files[0]));
+
+    $('reseed').addEventListener('click', () => { variant++; render(); });
+    $('png').addEventListener('click', () => {
+      const out = document.createElement('canvas'); paint(out, 2400, 1);
+      const a = document.createElement('a'); a.download = `glyphics-${tab === 'link' ? link.id : 'image'}-${variant}.png`; a.href = out.toDataURL('image/png'); a.click();
+    });
+    $('save').addEventListener('click', () => {
+      if (!link) return;
+      const reg = readLocal();
+      reg[link.id] = { key: link.key, type: 'url', url: link.url, created: Date.now() };
+      try { localStorage.setItem(KEY, JSON.stringify(reg)); $('save').textContent = 'Saved'; } catch { $('save').textContent = 'Save failed'; }
+    });
+
+    addEventListener('resize', () => { clearTimeout(timer); timer = setTimeout(render, 150); });
+    if (tab === 'image') document.querySelector('[data-tab=image]').click(); else update();
+  </script>
+</body>
+</html>

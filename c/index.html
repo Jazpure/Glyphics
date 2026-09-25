@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glyphics</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0a0a0a; color: #fff; font: 15px/1.5 system-ui, -apple-system, sans-serif; text-align: center; }
+    main { padding: 24px; max-width: 720px; }
+    img { max-width: 100%; max-height: 80vh; display: block; margin: 0 auto 12px; }
+    a { color: #ffd60a; }
+    .mono { font: 12px ui-monospace, "SF Mono", Menlo, monospace; color: #9a9a9a; }
+  </style>
+</head>
+<body>
+  <main id="out"></main>
+  <script>
+    // Where a scanned code lands: look the ID up in the site's codes.json, then
+    // in this browser's saved codes, and open the link or show the image.
+    const out = document.getElementById('out');
+    const q = new URLSearchParams(location.search), id = (q.get('id') || location.hash.slice(1)).replace(/\D/g, '');
+    const local = (() => { try { return JSON.parse(localStorage.getItem('glyphics.registry.v1') || '{}'); } catch { return {}; } })();
+    const say = (html) => { out.innerHTML = html; };
+    fetch('../codes.json').then((r) => (r.ok ? r.json() : { codes: {} })).catch(() => ({ codes: {} })).then((db) => {
+      const e = (db.codes || {})[id] || local[id];
+      if (!id || !e) { say('<p>Not linked</p>'); return; }
+      if (e.type === 'url') {
+        let u;
+        try { u = new URL(e.url); } catch { u = null; }
+        if (!u || !/^https?:$/.test(u.protocol)) { say('<p>Invalid link</p>'); return; }
+        const safe = u.href.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        say(`<p><a href="${safe}">${safe}</a></p>`);
+        location.replace(u.href);
+      } else if (e.type === 'image' && e.image && e.image.startsWith('data:image/')) {
+        out.innerHTML = '';
+        const img = new Image(); img.src = e.image; img.alt = e.name || 'Shared image';
+        out.append(img);
+      } else {
+        say('<p>Not available</p>');
+      }
+    });
+  </script>
+</body>
+</html>

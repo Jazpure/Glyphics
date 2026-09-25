@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>r8 test</title></head>
+<body>
+  <pre id="out"></pre>
+  <script src="../lib.js"></script>
+  <script src="../kit.js"></script>
+  <script src="code.js"></script>
+  <script src="directions.js"></script>
+  <script>
+    // Render one direction per call so a hang points at its culprit.
+    window.runOne = (i, seed = 7, id = 271828) => {
+      const c = document.createElement('canvas'); c.width = 1200; c.height = 900;
+      const x = c.getContext('2d'), t = performance.now();
+      x.save(); DIRECTIONS[i].draw(x, GL.rng(seed), GL.makeNoise(GL.rng(seed + 1)), { id }); x.restore();
+      const res = CODE.check(c, id);
+      return `${DIRECTIONS[i].name}: ${Math.round(performance.now() - t)}ms · ${res.label} · disagreements ${res.disagreements} · conf ${res.conf.toFixed(2)}`;
+    };
+  </script>
+</body>
+</html>

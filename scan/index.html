@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Glyphics — scan</title>
+  <style>
+    :root { --mono: ui-monospace, "SF Mono", Menlo, monospace; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0a0a0a; color: #fff; font: 16px/1.45 system-ui, -apple-system, sans-serif; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; }
+    header b { font-size: 18px; }
+    header a { color: #fff; text-decoration: none; }
+    .view { position: relative; width: 100%; max-width: 900px; margin: 0 auto; background: #000; aspect-ratio: 3 / 4; overflow: hidden; }
+    @media (min-aspect-ratio: 1/1) { .view { aspect-ratio: 4 / 3; } }
+    video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .start { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px; }
+    .panel { max-width: 900px; margin: 0 auto; padding: 14px 16px 32px; display: flex; flex-direction: column; gap: 12px; }
+    #status { font: 14px var(--mono); color: #bbb; min-height: 1.4em; }
+    button, .file { font: 15px system-ui, sans-serif; padding: 12px 16px; border: 0; border-radius: 4px; background: #fff; color: #000; cursor: pointer; text-align: center; }
+    .file { background: transparent; color: #fff; box-shadow: inset 0 0 0 1px #fff; display: block; }
+    .file input { display: none; }
+    #result { display: none; flex-direction: column; gap: 10px; padding: 14px; border-radius: 4px; background: #1b1b1b; }
+    #result.on { display: flex; }
+    #result .mono { font: 13px var(--mono); color: #aaa; }
+    #result .target { overflow-wrap: anywhere; }
+    #result img { width: 100%; height: auto; border-radius: 2px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .row > * { flex: 1; }
+  </style>
+</head>
+<body>
+  <header><a href="../"><b>Glyphics</b></a><a href="../app/">Make</a></header>
+
+  <div class="view" id="view">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+    <div class="start" id="start"><button id="go">Start camera</button></div>
+  </div>
+
+  <div class="panel">
+    <div id="status"></div>
+    <div id="result">
+      <div class="mono" id="rMeta"></div>
+      <div class="target" id="rTarget"></div>
+      <div class="row" id="rActions"></div>
+    </div>
+    <label class="file">Scan photo<input id="photo" type="file" accept="image/*"></label>
+  </div>
+
+  <script src="../sketches/lib.js"></script>
+  <script src="../sketches/kit.js"></script>
+  <script src="../sketches/r8/code.js"></script>
+  <script src="../app/rs.js"></script>
+  <script src="../app/imagecode.js"></script>
+  <script src="scan.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const video = $('video'), overlay = $('overlay'), grab = document.createElement('canvas'), gx = grab.getContext('2d', { willReadFrequently: true });
+    const sess = SCAN.session(), KEY = 'glyphics.registry.v1';
+    let running = false, frameNo = 0, remote = null, done = false;
+    const say = (t) => { $('status').textContent = t; };
+
+    const lookup = async (id) => {
+      if (!remote) remote = await fetch('../codes.json').then((r) => (r.ok ? r.json() : { codes: {} })).catch(() => ({ codes: {} }));
+      let local = {}; try { local = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch {}
+      return (remote.codes || {})[id] || local[id] || null;
+    };
+
+    function button(label, onClick, ghost) { const b = document.createElement('button'); b.textContent = label; b.onclick = onClick; if (ghost) { b.style.background = 'transparent'; b.style.color = '#fff'; b.style.boxShadow = 'inset 0 0 0 1px #fff'; } return b; }
+    async function show(hit) {
+      done = true;
+      video.pause(); // hold the frame that was read, under its outline
+      const meta = $('rMeta'), target = $('rTarget'), actions = $('rActions');
+      target.replaceChildren(); actions.replaceChildren();
+      if (hit.kind === 'image') {
+        // The carried image is small; show and save it smoothly enlarged.
+        const t = document.createElement('canvas'); t.width = hit.image.w; t.height = hit.image.h; t.getContext('2d').putImageData(hit.image.image, 0, 0);
+        const k = Math.max(1, Math.round(800 / Math.max(hit.image.w, hit.image.h))), big = document.createElement('canvas');
+        big.width = hit.image.w * k; big.height = hit.image.h * k;
+        const bx = big.getContext('2d'); bx.imageSmoothingQuality = 'high'; bx.drawImage(t, 0, 0, big.width, big.height);
+        const img = new Image(); img.src = big.toDataURL('image/png'); img.alt = 'Image carried by the code';
+        target.append(img);
+        const a = document.createElement('a'); a.download = 'glyphics-image.png'; a.href = img.src;
+        actions.append(button('Save', () => a.click()));
+      } else {
+        const e = await lookup(hit.id);
+        if (!e) target.textContent = 'Not linked';
+        else if (e.type === 'url') {
+          let u = null; try { u = new URL(e.url); } catch {}
+          if (u && /^https?:$/.test(u.protocol)) {
+            target.textContent = u.href;
+            actions.append(button('Open', () => { location.href = u.href; }));
+          } else target.textContent = 'Invalid link';
+        } else if (e.type === 'image' && e.image?.startsWith('data:image/')) {
+          const img = new Image(); img.src = e.image; img.alt = e.name || 'Shared image'; target.append(img);
+        } else target.textContent = 'Not available';
+      }
+      actions.append(button('Scan again', () => { done = false; sess.reset(); $('result').classList.remove('on'); if (running) video.play(); drawOverlay(null); }, true));
+      $('result').classList.add('on');
+      say('');
+    }
+
+    // Outline of what the scanner sees, on top of the video (object-fit: cover).
+    function drawOverlay(E, W, H, locked) {
+      const r = overlay.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+      overlay.width = r.width * dpr; overlay.height = r.height * dpr;
+      const x = overlay.getContext('2d'); x.clearRect(0, 0, overlay.width, overlay.height);
+      if (!E) return;
+      const s = Math.max(overlay.width / W, overlay.height / H), ox = (overlay.width - W * s) / 2, oy = (overlay.height - H * s) / 2;
+      x.strokeStyle = locked ? '#3ddc84' : '#ffffff'; x.lineWidth = 3 * dpr;
+      x.beginPath(); x.ellipse(ox + E.cx * s, oy + E.cy * s, E.a * s, E.b * s, E.theta, 0, Math.PI * 2); x.stroke();
+    }
+
+    function tick() {
+      if (!running) return;
+      if (!done && video.readyState >= 2 && video.videoWidth) {
+        const W = video.videoWidth, H = video.videoHeight;
+        if (grab.width !== W) { grab.width = W; grab.height = H; }
+        gx.drawImage(video, 0, 0, W, H);
+        const px = gx.getImageData(0, 0, W, H).data;
+        frameNo++;
+        // Image codes are heavier to try; attempt them on every third frame.
+        const r = sess.frame(px, W, H, { tryImage: frameNo % 3 === 0, pitches: [10, 9, 11, 8, 12] });
+        drawOverlay(r.E, W, H, !!r.kind);
+        if (r.kind) show(r);
+      }
+      setTimeout(() => requestAnimationFrame(tick), 60);
+    }
+
+    async function start() {
+      $('start').style.display = 'none';
+      try {
+        let stream;
+        if (new URLSearchParams(location.search).has('test')) stream = await testStream();
+        else stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+        video.srcObject = stream; await video.play();
+        running = true; tick();
+      } catch (err) {
+        $('start').style.display = 'grid';
+        say('Camera unavailable');
+      }
+    }
+    $('go').addEventListener('click', start);
+
+    // A photo or screenshot: try every mirror and pitch.
+    $('photo').addEventListener('change', (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      const url = URL.createObjectURL(f), img = new Image();
+      img.onload = () => {
+        const s = Math.min(1, 1600 / Math.max(img.width, img.height)), W = Math.round(img.width * s), H = Math.round(img.height * s);
+        const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, W, H);
+        const px = x.getImageData(0, 0, W, H).data, one = SCAN.session();
+        let r = null;
+        for (let k = 0; k < 3 && !(r && r.kind); k++) r = one.frame(px, W, H, { tryImage: k === 0, pitches: SCAN.PITCHES_ALL });
+        URL.revokeObjectURL(url);
+        if (r && r.kind) show(r); else say(r && r.found ? 'Couldn’t read' : 'No code found');
+      };
+      img.src = url;
+    });
+
+    // Test mode (?test): a simulated camera showing a code that drifts, turns and tilts.
+    async function testStream() {
+      const q = new URLSearchParams(location.search), id = Number(q.get('id') || 271828);
+      const code = document.createElement('canvas'); code.width = 1200; code.height = 900;
+      const cx = code.getContext('2d');
+      if (q.get('test') === 'image') {
+        const pic = document.createElement('canvas'); pic.width = 320; pic.height = 240; const p = pic.getContext('2d');
+        const g = p.createLinearGradient(0, 0, 0, 240); g.addColorStop(0, '#2f6fd8'); g.addColorStop(1, '#e8743b'); p.fillStyle = g; p.fillRect(0, 0, 320, 240);
+        p.fillStyle = '#fff3c4'; p.beginPath(); p.arc(220, 80, 36, 0, 7); p.fill(); p.fillStyle = '#2d5a27'; p.fillRect(0, 180, 320, 60);
+        IMAGECODE.draw(cx, IMAGECODE.encode(pic, 10), 3);
+      } else {
+        await new Promise((res) => { const s = document.createElement('script'); s.src = '../app/glyph.js'; s.onload = res; document.head.append(s); });
+        const c = GLYPH.fromUrl(GLYPH.normaliseUrl('jasper-curtis.com'));
+        GLYPH.draw(cx, { id, seed: c.seed, params: c.params });
+      }
+      const cam = document.createElement('canvas'); cam.width = 1280; cam.height = 720; const k = cam.getContext('2d');
+      const t0 = performance.now();
+      (function paint() {
+        const t = (performance.now() - t0) / 1000;
+        k.fillStyle = '#d8d4cc'; k.fillRect(0, 0, 1280, 720);
+        k.save(); k.translate(640 + Math.sin(t * 0.4) * 60, 360 + Math.cos(t * 0.3) * 30); k.rotate(0.5 + Math.sin(t * 0.2) * 0.6); k.scale(0.62, 0.62 * (0.85 + 0.1 * Math.sin(t * 0.5)));
+        k.filter = 'blur(1.2px) saturate(0.85) brightness(0.95)'; k.drawImage(code, -600, -450); k.restore();
+        requestAnimationFrame(paint);
+      })();
+      return cam.captureStream(30);
+    }
+  </script>
+</body>
+</html>
