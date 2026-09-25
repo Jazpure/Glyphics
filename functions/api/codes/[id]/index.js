@@ -1,6 +1,6 @@
 // GET /api/codes/:id: what a code points to, as { type: 'url', url } or
 // { type: 'image', src }.
-import { json, store, ID } from '../_store.js';
+import { json, store, ID } from '../../_store.js';
 
 export async function onRequestGet({ params, env }) {
   const kv = store(env);

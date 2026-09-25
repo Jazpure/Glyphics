@@ -1,182 +1,22 @@
-/* Glyphics scanner: find a code in a camera frame (or photo) and read it.
+/* Glyphics scanner: finds a Glyphics code (the Free Scale sheet drawn by
+   app/tilecode.js) in a camera frame and reads its ID.
 
-   Finding. Pixels that belong to a code are dark or strongly coloured; paper
-   is light and grey. The largest region of those pixels, with its holes filled,
-   is the black oval, and its second moments give an ellipse: centre, semi-axes
-   and tilt. Mapping the canonical oval onto that ellipse undoes scale, rotation
-   and foreshortening (tilt up to ~25° reads fine; beyond, perspective bends it).
-   Rotation is only known up to 180° from the ellipse; the decoders search
-   rotations themselves.
+   Finding. The code's dot grid is the one regular thing in the frame. Small
+   blobs are picked out around the middle of the frame, and the displacement
+   that turns up most often between neighbouring blobs is the grid's step, in
+   two directions. From a dot near the middle the grid is followed outward:
+   each predicted dot is pulled onto the dot actually there and the
+   perspective is refitted as it grows. Where the dots stop gives the sheet's
+   edges, whatever is around it: white paper, a dark screen, a desk.
 
-   Reading. For link codes, many points in the core of each ring sector vote
-   for red, yellow or blue; votes add up across steady frames. For image codes,
-   each bead centre is sampled and Reed–Solomon does the rest. */
+   Reading. In each 2 × 2 group of dots one is filled black. The darkest of
+   the four is read, averaged over frames, and Reed–Solomon in tilecode.js
+   does the rest. */
 (function () {
-  const { TAU, O } = window.GL;
-  const C = window.CODE, IC = window.IMAGECODE;
-  const DW = 480, CLOSE = 3; // detection width; closing radius in detection pixels
+  const T = window.TILECODE, TAU = Math.PI * 2;
 
-  // Hue class for camera pixels: nearest of red / yellow / blue, or -1.
-  const HUES = [8, 52, 222];
-  function hueClass(R, G, B, white = false) {
-    const mx = Math.max(R, G, B), mn = Math.min(R, G, B), v = mx / 255, s = mx ? (mx - mn) / mx : 0;
-    if (white && s < 0.28 && v > 0.62) return 3;
-    if (s < 0.3 || v < 0.22) return -1;
-    let h = mx === R ? ((G - B) / (mx - mn)) * 60 : mx === G ? (2 + (B - R) / (mx - mn)) * 60 : (4 + (R - G) / (mx - mn)) * 60;
-    if (h < 0) h += 360;
-    let best = -1, bd = 60;
-    HUES.forEach((c, i) => { const d = Math.min(Math.abs(h - c), 360 - Math.abs(h - c)); if (d < bd) { bd = d; best = i; } });
-    return best;
-  }
-
-  // ---------- finding the oval ----------
-  // Separable box max (grow) or min (shrink) of a binary mask, in place: a
-  // sliding count of ones over a (2r + 1) window, first along rows, then columns.
-  // Outside the frame counts as empty when growing and as full when shrinking.
-  function box(m, W, H, r, grow) {
-    const t = new Uint8Array(m.length), oob = grow ? 0 : 1, full = 2 * r + 1;
-    const out = (ones) => (grow ? (ones > 0 ? 1 : 0) : ones === full ? 1 : 0);
-    for (let y = 0; y < H; y++) {
-      let ones = 0;
-      for (let k = -r; k <= r; k++) ones += k < 0 || k >= W ? oob : m[y * W + k];
-      for (let x = 0; x < W; x++) {
-        t[y * W + x] = out(ones);
-        const i = x + r + 1, o = x - r;
-        ones += (i >= W ? oob : m[y * W + i]) - (o < 0 ? oob : m[y * W + o]);
-      }
-    }
-    for (let x = 0; x < W; x++) {
-      let ones = 0;
-      for (let k = -r; k <= r; k++) ones += k < 0 || k >= H ? oob : t[k * W + x];
-      for (let y = 0; y < H; y++) {
-        m[y * W + x] = out(ones);
-        const i = y + r + 1, o = y - r;
-        ones += (i >= H ? oob : t[i * W + x]) - (o < 0 ? oob : t[o * W + x]);
-      }
-    }
-  }
-  function close(m, W, H, r) { box(m, W, H, r, true); box(m, W, H, r, false); }
-
-  function detect(frame, W, H) {
-    const DH = Math.round((DW * H) / W), sx = W / DW, m = new Uint8Array(DW * DH);
-    // Downsample by point sampling the full frame.
-    for (let j = 0; j < DH; j++) for (let i = 0; i < DW; i++) {
-      const o = (Math.floor(j * sx) * W + Math.floor(i * sx)) * 4, R = frame[o], G = frame[o + 1], B = frame[o + 2];
-      const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
-      m[j * DW + i] = mx < 85 || (mx > 60 && (mx - mn) / mx > 0.45) ? 1 : 0;
-    }
-    // Closing (grow, then shrink): bridges the thin white rim, outlines and
-    // shadows so the whole oval is one region; white shapes become holes.
-    close(m, DW, DH, CLOSE);
-    // Connected regions of code pixels (4-connected).
-    const lab = new Int32Array(DW * DH), comps = [], stack = [];
-    let next = 1;
-    for (let p = 0; p < m.length; p++) {
-      if (!m[p] || lab[p]) continue;
-      let area = 0, x0 = DW, y0 = DH, x1 = 0, y1 = 0;
-      lab[p] = next; stack.push(p);
-      while (stack.length) {
-        const q = stack.pop(), x = q % DW, y = (q / DW) | 0;
-        area++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-        if (x > 0 && m[q - 1] && !lab[q - 1]) { lab[q - 1] = next; stack.push(q - 1); }
-        if (x < DW - 1 && m[q + 1] && !lab[q + 1]) { lab[q + 1] = next; stack.push(q + 1); }
-        if (y > 0 && m[q - DW] && !lab[q - DW]) { lab[q - DW] = next; stack.push(q - DW); }
-        if (y < DH - 1 && m[q + DW] && !lab[q + DW]) { lab[q + DW] = next; stack.push(q + DW); }
-      }
-      if (area > 150) comps.push({ id: next, area, x0, y0, x1, y1 });
-      next++;
-    }
-    comps.sort((a, b) => b.area - a.area);
-    let best = null;
-    // The oval's outer black ring and its interior can come apart at the white
-    // rim; fill each candidate's holes and keep the best-fitting, largest ellipse.
-    for (const c of comps.slice(0, 4)) {
-      const w = c.x1 - c.x0 + 3, h = c.y1 - c.y0 + 3, out = new Uint8Array(w * h), st = [];
-      const inComp = (x, y) => { const X = x + c.x0 - 1, Y = y + c.y0 - 1; return X >= 0 && Y >= 0 && X < DW && Y < DH && lab[Y * DW + X] === c.id; };
-      // Flood the outside from the padded border; everything not reached is the filled region.
-      out[0] = 1; st.push(0);
-      while (st.length) {
-        const q = st.pop(), x = q % w, y = (q / w) | 0;
-        for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
-          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-          const k = ny * w + nx;
-          if (!out[k] && !inComp(nx, ny)) { out[k] = 1; st.push(k); }
-        }
-      }
-      let A = 0, mx = 0, my = 0, mxx = 0, myy = 0, mxy = 0;
-      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (!out[y * w + x]) { const X = x + c.x0 - 1, Y = y + c.y0 - 1; A++; mx += X; my += Y; mxx += X * X; myy += Y * Y; mxy += X * Y; }
-      if (A < 600) continue;
-      mx /= A; my /= A;
-      const cxx = mxx / A - mx * mx, cyy = myy / A - my * my, cxy = mxy / A - mx * my;
-      const tr = cxx + cyy, det = cxx * cyy - cxy * cxy, disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
-      const l1 = tr / 2 + disc, l2 = tr / 2 - disc, a = 2 * Math.sqrt(l1), b = 2 * Math.sqrt(Math.max(l2, 1e-6));
-      const fill = A / (Math.PI * a * b), aspect = a / b;
-      if (fill < 0.88 || fill > 1.08 || aspect < 1.05 || aspect > 2.1 || a < DW * 0.08) continue;
-      const cand = { cx: mx * sx, cy: my * sx, a: a * sx, b: b * sx, theta: 0.5 * Math.atan2(2 * cxy, cxx - cyy), filled: A, fill, aspect };
-      if (!best || cand.filled > best.filled) best = cand;
-    }
-    return best;
-  }
-
-  // Canonical normalised oval coordinates (u along the long axis) → frame pixel.
-  function mapper(E, mirror) {
-    const c = Math.cos(E.theta), s = Math.sin(E.theta), f = mirror ? -1 : 1;
-    return (u, v) => [E.cx + E.a * u * c - E.b * f * v * s, E.cy + E.a * u * s + E.b * f * v * c];
-  }
-  const pixel = (frame, W, H, x, y) => { const X = Math.round(x), Y = Math.round(y); if (X < 0 || Y < 0 || X >= W || Y >= H) return null; const o = (Y * W + X) * 4; return [frame[o], frame[o + 1], frame[o + 2]]; };
-
-  // ---------- link codes ----------
-  // Votes per slot for one frame: many points in each sector's core.
-  function linkVotes(frame, W, H, E, mirror) {
-    const map = mapper(E, mirror), votes = Array.from({ length: C.SECTORS * 2 }, () => [0, 0, 0]);
-    C.SAMPLE.forEach(([q0, q1], b) => {
-      for (let s = 0; s < C.SECTORS; s++) for (let qi = 0; qi < 4; qi++) for (let ti = 0; ti < 7; ti++) {
-        const q = q0 + ((qi + 0.5) / 4) * (q1 - q0), th = ((s + 0.5 + ((ti + 0.5) / 7 - 0.5) * C.CORE) / C.SECTORS) * TAU;
-        const px = pixel(frame, W, H, ...map(q * Math.sin(th), -q * Math.cos(th)));
-        if (!px) continue;
-        const k = hueClass(...px);
-        if (k >= 0) votes[b * C.SECTORS + s][k]++;
-      }
-    });
-    return votes;
-  }
-  function decodeVotes(votes) {
-    const slots = votes.map((c) => { const t = c[0] + c[1] + c[2]; if (t < 3) return [-1, 0]; const m = c.indexOf(Math.max(...c)); return [m, c[m] / t]; });
-    return C.decode(slots);
-  }
-
-  // ---------- image codes ----------
-  const LAT = {};
-  const PITCHES_ALL = Array.from({ length: 17 }, (_, i) => 7 + i * 0.5);
-  // Bright or colourful blobs inside the oval: candidate beads, as centroids.
-  function beadBlobs(frame, W, H, E) {
-    const R = E.a * 1.02, x0 = Math.max(0, Math.floor(E.cx - R)), y0 = Math.max(0, Math.floor(E.cy - R)), x1 = Math.min(W, Math.ceil(E.cx + R)), y1 = Math.min(H, Math.ceil(E.cy + R));
-    const w = x1 - x0, h = y1 - y0, m = new Uint8Array(w * h), c = Math.cos(E.theta), sn = Math.sin(E.theta);
-    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
-      const dx = x0 + i - E.cx, dy = y0 + j - E.cy, u = (dx * c + dy * sn) / E.a, v = (-dx * sn + dy * c) / E.b;
-      if (u * u + v * v > 0.93) continue; // inside the white rim
-      const o = ((y0 + j) * W + x0 + i) * 4, R0 = frame[o], G0 = frame[o + 1], B0 = frame[o + 2], mx = Math.max(R0, G0, B0), mn = Math.min(R0, G0, B0);
-      if (mx > 95 && ((mx - mn) / mx > 0.35 || mx > 150)) m[j * w + i] = 1;
-    }
-    const seen = new Uint8Array(w * h), out = [], st = [];
-    for (let p = 0; p < m.length; p++) {
-      if (!m[p] || seen[p]) continue;
-      let n = 0, sx = 0, sy = 0;
-      seen[p] = 1; st.push(p);
-      while (st.length) {
-        const q = st.pop(), x = q % w, y = (q / w) | 0;
-        n++; sx += x; sy += y;
-        if (x > 0 && m[q - 1] && !seen[q - 1]) { seen[q - 1] = 1; st.push(q - 1); }
-        if (x < w - 1 && m[q + 1] && !seen[q + 1]) { seen[q + 1] = 1; st.push(q + 1); }
-        if (y > 0 && m[q - w] && !seen[q - w]) { seen[q - w] = 1; st.push(q - w); }
-        if (y < h - 1 && m[q + w] && !seen[q + w]) { seen[q + w] = 1; st.push(q + w); }
-      }
-      if (n >= 3) out.push([x0 + sx / n, y0 + sy / n, n]);
-    }
-    return out;
-  }
-  // Homography (canonical 1200 × 900 → frame pixels) from point pairs, by
-  // normalised linear least squares with h33 = 1.
+  // ---------- geometry ----------
+  // Homography from point pairs [x, y, u, v] (normalised DLT, h33 = 1).
   function fitH(pairs) {
     const norm = (pts) => {
       const n = pts.length, mx = pts.reduce((a, p) => a + p[0], 0) / n, my = pts.reduce((a, p) => a + p[1], 0) / n;
@@ -190,503 +30,267 @@
       for (const [row, rhs] of [[[x, y, 1, 0, 0, 0, -x * u, -y * u], u], [[0, 0, 0, x, y, 1, -x * v, -y * v], v]])
         for (let r = 0; r < 8; r++) { if (!row[r]) continue; for (let c = 0; c < 8; c++) M[r][c] += row[r] * row[c]; M[r][8] += row[r] * rhs; }
     });
-    for (let c = 0; c < 8; c++) { // Gaussian elimination with partial pivoting
+    for (let c = 0; c < 8; c++) {
       let piv = c; for (let r = c + 1; r < 8; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
       [M[c], M[piv]] = [M[piv], M[c]];
       if (Math.abs(M[c][c]) < 1e-12) return null;
       for (let r = 0; r < 8; r++) if (r !== c) { const f = M[r][c] / M[c][c]; for (let k = c; k < 9; k++) M[r][k] -= f * M[c][k]; }
     }
     const h = Array.from({ length: 8 }, (_, r) => M[r][8] / M[r][r]).concat([1]);
-    const mul = (P, Q) => Array.from({ length: 9 }, (_, i) => P[(i / 3 | 0) * 3] * Q[i % 3] + P[(i / 3 | 0) * 3 + 1] * Q[3 + (i % 3)] + P[(i / 3 | 0) * 3 + 2] * Q[6 + (i % 3)]);
     return mul(B.Ti, mul(h, A.T));
   }
-  // Affine fit (canonical → frame), for early stages where perspective can't be pinned down yet.
+  // Affine fit, for the first steps, where perspective can't be pinned down yet.
   function fitA(pairs) {
     const S = Array.from({ length: 3 }, () => new Float64Array(3)), bx = new Float64Array(3), by = new Float64Array(3);
     for (const [x, y, u, v] of pairs) { const r = [x, y, 1]; for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) S[i][j] += r[i] * r[j]; bx[i] += r[i] * u; by[i] += r[i] * v; } }
-    const solve = (b) => { // 3 × 3 by Cramer's rule
-      const d = (m) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-      const D = d(S); if (Math.abs(D) < 1e-9) return null;
-      return [0, 1, 2].map((c) => d(S.map((row, i) => row.map((v, j) => (j === c ? b[i] : v)))) / D);
-    };
+    const det = (m) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const D = det(S); if (Math.abs(D) < 1e-9) return null;
+    const solve = (b) => [0, 1, 2].map((c) => det(S.map((row, i) => row.map((v, j) => (j === c ? b[i] : v)))) / D);
     const X = solve(bx), Y = solve(by);
-    return X && Y ? [X[0], X[1], X[2], Y[0], Y[1], Y[2], 0, 0, 1] : null;
+    return [X[0], X[1], X[2], Y[0], Y[1], Y[2], 0, 0, 1];
   }
+  const mul = (P, Q) => Array.from({ length: 9 }, (_, k) => P[((k / 3) | 0) * 3] * Q[k % 3] + P[((k / 3) | 0) * 3 + 1] * Q[3 + (k % 3)] + P[((k / 3) | 0) * 3 + 2] * Q[6 + (k % 3)]);
   const applyH = (Hm, x, y) => { const w = Hm[6] * x + Hm[7] * y + Hm[8]; return [(Hm[0] * x + Hm[1] * y + Hm[2]) / w, (Hm[3] * x + Hm[4] * y + Hm[5]) / w]; };
-  // Full camera model: perspective (H), then radial lens distortion k about the frame centre.
-  function project(M, x, y) {
-    const [u, v] = applyH(M.H, x, y);
-    if (!M.k) return [u, v];
-    const nx = (u - M.cx) / M.r0, ny = (v - M.cy) / M.r0, f = 1 + M.k * (nx * nx + ny * ny);
-    return [M.cx + nx * f * M.r0, M.cy + ny * f * M.r0];
-  }
-  function undistort(M, u, v) {
-    if (!M.k) return [u, v];
-    const nx = (u - M.cx) / M.r0, ny = (v - M.cy) / M.r0;
-    let dx = nx, dy = ny;
-    for (let it = 0; it < 5; it++) { const f = 1 + M.k * (dx * dx + dy * dy); dx = nx / f; dy = ny / f; }
-    return [M.cx + dx * M.r0, M.cy + dy * M.r0];
-  }
-  // The code's empty black centre, found as the largest bead-free area near the
-  // oval's middle. Under tilt it is the true centre; the outline's centre is not.
-  function voidCentre(blobs, E, spacing) {
-    const d = Math.max(2, spacing / 3), half = E.a * 0.4, gw = Math.ceil((2 * half) / d), ox = E.cx - half, oy = E.cy - half, g = new Float32Array(gw * gw).fill(1e9);
-    for (const [x, y, n] of blobs) {
-      const r = Math.max(1, Math.sqrt(n / Math.PI) / d), gx = (x - ox) / d, gy = (y - oy) / d;
-      for (let j = Math.floor(gy - r); j <= Math.ceil(gy + r); j++) for (let i = Math.floor(gx - r); i <= Math.ceil(gx + r); i++) if (i >= 0 && j >= 0 && i < gw && j < gw) g[j * gw + i] = 0;
-    }
-    // Chamfer distance transform (two passes).
-    for (let j = 0; j < gw; j++) for (let i = 0; i < gw; i++) { const k = j * gw + i; if (i) g[k] = Math.min(g[k], g[k - 1] + 1); if (j) g[k] = Math.min(g[k], g[k - gw] + 1); if (i && j) g[k] = Math.min(g[k], g[k - gw - 1] + 1.4); if (j && i < gw - 1) g[k] = Math.min(g[k], g[k - gw + 1] + 1.4); }
-    for (let j = gw - 1; j >= 0; j--) for (let i = gw - 1; i >= 0; i--) { const k = j * gw + i; if (i < gw - 1) g[k] = Math.min(g[k], g[k + 1] + 1); if (j < gw - 1) g[k] = Math.min(g[k], g[k + gw] + 1); if (i < gw - 1 && j < gw - 1) g[k] = Math.min(g[k], g[k + gw + 1] + 1.4); if (j < gw - 1 && i) g[k] = Math.min(g[k], g[k + gw - 1] + 1.4); }
-    let mx = 0; for (let k = 0; k < g.length; k++) if (g[k] < 1e8 && g[k] > mx) mx = g[k];
-    if (mx < 3) return null;
-    let sx = 0, sy = 0, n = 0;
-    for (let j = 0; j < gw; j++) for (let i = 0; i < gw; i++) if (g[j * gw + i] >= mx * 0.55 && g[j * gw + i] < 1e8) { sx += i; sy += j; n++; }
-    return [ox + (sx / n + 0.5) * d, oy + (sy / n + 0.5) * d];
-  }
-  // The ellipse fit as a starting homography, optionally mirrored or turned 180°.
-  function startH(E, mirror, flip) {
-    const c = Math.cos(E.theta), s = Math.sin(E.theta), fu = flip ? -1 : 1, fv = (flip ? -1 : 1) * (mirror ? -1 : 1), ka = E.a / O.rx, kb = E.b / O.ry;
-    const h0 = ka * c * fu, h1 = -kb * s * fv, h3 = ka * s * fu, h4 = kb * c * fv;
-    return [h0, h1, E.cx - h0 * O.cx - h1 * O.cy, h3, h4, E.cy - h3 * O.cx - h4 * O.cy, 0, 0, 1];
-  }
-  // Pull the starting guess onto the beads actually seen: match lattice beads to
-  // nearby blobs and refit, growing outward from the centre band by band (each
-  // fit predicts the next band well), then solve for lens distortion.
-  function register(blobs, grid, cell, L, H0, spacing, frameW, frameH, k0 = null) {
-    const M = { H: H0, k: k0 ?? 0, cx: frameW / 2, cy: frameH / 2, r0: Math.hypot(frameW, frameH) / 2 };
-    const qOf = (b) => Math.hypot((b.x - O.cx) / O.rx, (b.y - O.cy) / O.ry);
-    const Lq = L.map((b) => [b, qOf(b)]);
-    const match = (qmax, rad) => {
-      const pairs = [], r2 = (rad * spacing) ** 2;
-      for (const [b, q] of Lq) {
-        if (q > qmax) continue;
-        const [x, y] = project(M, b.x, b.y), gx = Math.floor(x / cell), gy = Math.floor(y / cell);
-        let best = null, bd = r2;
-        for (let i = gx - 1; i <= gx + 1; i++) for (let j = gy - 1; j <= gy + 1; j++) for (const k of grid.get(i * 65536 + j) || []) { const d = (blobs[k][0] - x) ** 2 + (blobs[k][1] - y) ** 2; if (d < bd) { bd = d; best = k; } }
-        if (best !== null) pairs.push([b.x, b.y, blobs[best][0], blobs[best][1], bd]);
-      }
-      return pairs;
-    };
-    const refit = (pairs, affine) => {
-      pairs.sort((a, b) => a[4] - b[4]);
-      const keep = pairs.slice(0, Math.floor(pairs.length * 0.85)).map((p) => [p[0], p[1], ...undistort(M, p[2], p[3])]);
-      const Hn = affine ? fitA(keep) : fitH(keep);
-      if (Hn) M.H = Hn;
-      return !!Hn;
-    };
-    // Following on from the last frame (k0 given): the start is already close.
-    if (k0 !== null) {
-      let pairs = [];
-      // Outward from the centre, which moves least when the phone turns a little.
-      for (const [q, rad] of [[0.5, 0.45], [0.75, 0.45], [1, 0.45], [1, 0.4], [1, 0.35]]) { pairs = match(q, rad); if (pairs.length < 30 || !refit(pairs, false)) return null; }
-      return { M, matched: pairs.length / Lq.length };
-    }
-    // The outline gives rotation and scale only roughly under tilt: try small
-    // turns and scalings about the centre and keep the start that matches the
-    // most inner beads tightly.
-    const base = M.H.slice(), [ccx, ccy] = applyH(base, O.cx, O.cy);
-    let bestH = base, bestN = -1;
-    for (let da = -0.06; da <= 0.0601; da += 0.015) for (let ds = 0.92; ds <= 1.0801; ds += 0.02) for (const dq of [0.96, 1, 1.04]) {
-      // Turn by da, scale by ds (and squash by dq) about the found centre.
-      const c = Math.cos(da) * ds, sn = Math.sin(da) * ds, A = [c, -sn * dq, sn, c * dq];
-      const Hc = [A[0] * base[0] + A[1] * base[3], A[0] * base[1] + A[1] * base[4], 0, A[2] * base[0] + A[3] * base[3], A[2] * base[1] + A[3] * base[4], 0, 0, 0, 1];
-      const [u, v] = applyH(Hc, O.cx, O.cy); Hc[2] = ccx - u; Hc[5] = ccy - v;
-      M.H = Hc;
-      const n = match(0.22, 0.4).length;
-      if (n > bestN) { bestN = n; bestH = Hc; }
-    }
-    M.H = bestH;
-    // Small outward steps: affine while the matched area is small, full
-    // perspective once enough of the oval is in play, lens distortion last.
-    const steps = [];
-    for (let q = 0.22; q < 1; q += 0.05) steps.push([Math.min(1, q), 0.45]);
-    steps.push([1, 0.45], [1, 0.4], [1, 0.35], [1, 0.35]);
-    let pairs = [];
-    for (let s = 0; s < steps.length; s++) {
-      pairs = match(...steps[s]);
-      if (pairs.length < 30 || !refit(pairs, steps[s][0] < 0.45)) return null;
-      if (steps[s][0] >= 0.85) {
-        let num = 0, den = 0;
-        for (const p of pairs) {
-          const [u, v] = applyH(M.H, p[0], p[1]), nx = (u - M.cx) / M.r0, ny = (v - M.cy) / M.r0, r2 = nx * nx + ny * ny;
-          num += ((p[2] - u) / M.r0) * nx * r2 + ((p[3] - v) / M.r0) * ny * r2; den += r2 * r2 * r2;
-        }
-        // Residuals are measured against the undistorted projection, so this is the total k.
-        if (den > 0) M.k = Math.max(-0.3, Math.min(0.3, num / den));
-      }
-    }
-    const total = Lq.length;
-    return { M, matched: pairs.length / total };
-  }
-  // Bilinear sample of the frame at (x, y), added into acc with weight w.
-  function addSample(frame, W, H, x, y, w, acc) {
-    if (x < 0 || y < 0 || x >= W - 1 || y >= H - 1) return 0;
-    const X = x | 0, Y = y | 0, fx = x - X, fy = y - Y, o = (Y * W + X) * 4, o2 = o + W * 4;
-    for (let k = 0; k < 3; k++) {
-      const a = frame[o + k] + (frame[o + 4 + k] - frame[o + k]) * fx, b = frame[o2 + k] + (frame[o2 + 4 + k] - frame[o2 + k]) * fx;
-      acc[k] += w * (a + (b - a) * fy);
-    }
-    return w;
-  }
-  // Raw colour of each bead: a centre-weighted average over its middle, where a
-  // blurred bead keeps the most of its own colour.
-  function beadRGB(frame, W, H, L, M, unit) {
-    const out = new Float32Array(L.length * 3), acc = [0, 0, 0];
-    L.forEach((b, i) => {
-      const [x, y] = project(M, b.x, b.y), rad = Math.max(0.6, 0.22 * b.s * unit), st = Math.max(0.5, rad / 2), s2 = 2 * (rad * 0.7) ** 2;
-      acc[0] = acc[1] = acc[2] = 0; let wsum = 0;
-      for (let dy = -rad; dy <= rad + 1e-6; dy += st) for (let dx = -rad; dx <= rad + 1e-6; dx += st) {
-        const d2 = dx * dx + dy * dy; if (d2 > rad * rad) continue;
-        wsum += addSample(frame, W, H, x + dx, y + dy, Math.exp(-d2 / s2), acc);
-      }
-      if (wsum) for (let k = 0; k < 3; k++) out[i * 3 + k] = acc[k] / wsum;
-    });
-    return out;
-  }
-  // Sort colours into the four bead classes. Classes are learned from this
-  // frame's own colours and compared by chroma, so dim beads still sort.
-  function classify(rgb, n) {
-    const col = (i) => [rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]];
-    const feat = (c) => { const m = Math.max(c[0], c[1], c[2], 1); return [c[0] / m, c[1] / m, c[2] / m, (m / 255) * 0.5]; };
-    const first = Array.from({ length: n }, (_, i) => { const c = col(i); return hueClass(c[0], c[1], c[2], true); });
-    const sum = [0, 1, 2, 3].map(() => [0, 0, 0, 0, 0]);
-    for (let i = 0; i < n; i++) if (first[i] >= 0) { const f = feat(col(i)), s = sum[first[i]]; for (let j = 0; j < 4; j++) s[j] += f[j]; s[4]++; }
-    const mean = sum.map((s) => (s[4] ? s.slice(0, 4).map((v) => v / s[4]) : null));
-    return Array.from({ length: n }, (_, i) => {
-      const c = col(i);
-      if (Math.max(...c) < 50) return first[i] >= 0 ? first[i] : 0;
-      const f = feat(c);
-      let best = first[i] >= 0 ? first[i] : 0, bd = Infinity;
-      mean.forEach((m, k) => { if (!m) return; const d = (f[0] - m[0]) ** 2 + (f[1] - m[1]) ** 2 + (f[2] - m[2]) ** 2 + (f[3] - m[3]) ** 2; if (d < bd) { bd = d; best = k; } });
-      return best;
-    });
-  }
-  function beadColours(frame, W, H, L, M, unit) { return classify(beadRGB(frame, W, H, L, M, unit), L.length); }
-  function gridOf(blobs, cell) {
-    const grid = new Map();
-    blobs.forEach((b, k) => { const key = Math.floor(b[0] / cell) * 65536 + Math.floor(b[1] / cell); if (!grid.has(key)) grid.set(key, []); grid.get(key).push(k); });
-    return grid;
-  }
-  // Follow a registration from the previous frame: shift it by how far the
-  // outline moved, then refine. Much cheaper than searching from scratch.
-  function track(frame, W, H, E, last) {
-    const blobs = beadBlobs(frame, W, H, E);
-    if (blobs.length < 60) return null;
-    const spacing = last.p * (E.a / O.rx), cell = Math.max(4, spacing), dx = E.cx - last.E.cx, dy = E.cy - last.E.cy, h = last.M.H;
-    const H0 = [h[0] + dx * h[6], h[1] + dx * h[7], h[2] + dx * h[8], h[3] + dy * h[6], h[4] + dy * h[7], h[5] + dy * h[8], h[6], h[7], h[8]];
-    const reg = register(blobs, gridOf(blobs, cell), cell, last.L, H0, spacing, W, H, last.M.k);
-    // Only trust it if it fits about as well as the full search did.
-    return reg && reg.matched >= last.ref * 0.85 ? { ...last, spacing, ...reg } : null;
-  }
-  // Where the lattice sits in this frame, for each pitch and mirror that fit; best first.
-  function registerAll(frame, W, H, E, pitches, mirrors) {
-    const blobs = beadBlobs(frame, W, H, E);
-    if (blobs.length < 60) return [];
-    const scale = E.a / O.rx;
-    // Which lattice (pitch) fits the blobs best? Decode only the best few.
-    const tried = [];
-    for (const p of pitches) {
-      const L = (LAT[p] ||= IC.lattice(p)), spacing = p * scale, cell = Math.max(4, spacing), grid = gridOf(blobs, cell);
-      const vc = voidCentre(blobs, E, spacing);
-      for (const mirror of mirrors) {
-        const H0 = startH(E, mirror, false);
-        if (vc) { const [x, y] = applyH(H0, O.cx, O.cy); H0[2] += vc[0] - x; H0[5] += vc[1] - y; }
-        const reg = register(blobs, grid, cell, L, H0, spacing, W, H);
-        if (reg) tried.push({ p, L, spacing, mirror, ...reg });
-      }
-    }
-    return tried.sort((a, b) => b.matched - a.matched);
-  }
-  // Decode bead colours; the lattice looks the same turned 180°, so only the data can tell.
-  function decodeRGB(rgb, L, p) {
-    const syms = classify(rgb, L.length);
-    for (const flip of [false, true]) {
-      const res = IC.decodeSyms(flip ? rotate180(syms, L) : syms, p);
-      if (res.ok) return res;
-    }
-    return null;
-  }
-  function imageRead(frame, W, H, E, { pitches = [7], mirrors = [false] } = {}) {
-    for (const t of registerAll(frame, W, H, E, pitches, mirrors).slice(0, 3)) {
-      const res = decodeRGB(beadRGB(frame, W, H, t.L, t.M, t.spacing / t.p), t.L, t.p);
-      if (res) return { ...res, pitch: t.p, matched: t.matched };
-    }
-    return null;
-  }
-  // Index of the bead half a turn round from each bead.
-  function turn180(L) {
-    if (L._r180) return L._r180;
-    const start = [];
-    L.forEach((s, i) => { if (s.i === 0) start[s.ring] = i; });
-    return (L._r180 = L.map((s) => start[s.ring] + ((s.i + s.N / 2) % s.N)));
-  }
-  function rotate180(syms, L) { const r = turn180(L); return r.map((j) => syms[j]); }
-  // Averages bead colours over frames: noise and compression change from frame
-  // to frame, the code does not, so holding the phone still sharpens the read.
-  function imageAverager() {
-    const acc = new Map();
-    let last = null;
-    return {
-      reset() { acc.clear(); last = null; },
-      add(frame, W, H, E, pitches, mirrors) {
-        const t = (last && track(frame, W, H, E, last)) || registerAll(frame, W, H, E, pitches, mirrors)[0];
-        last = t ? { ...t, E, ref: t.ref ?? t.matched } : null;
-        if (!t) return null;
-        let rgb = beadRGB(frame, W, H, t.L, t.M, t.spacing / t.p);
-        const one = decodeRGB(rgb, t.L, t.p);
-        if (one) return { ...one, pitch: t.p, matched: t.matched, frames: 1 };
-        const key = t.p + (t.mirror ? 'm' : ''), n = t.L.length;
-        let a = acc.get(key);
-        if (!a) acc.set(key, (a = { sum: new Float32Array(n * 3), w: 0, frames: 0 }));
-        if (a.w) {
-          // This frame may have locked on half a turn round; line it up with the average.
-          const r = turn180(t.L);
-          let same = 0, turned = 0;
-          for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) {
-            const m = a.sum[i * 3 + k] / a.w;
-            same += (rgb[i * 3 + k] - m) ** 2; turned += (rgb[r[i] * 3 + k] - m) ** 2;
-          }
-          if (turned < same) { const o = new Float32Array(n * 3); for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) o[i * 3 + k] = rgb[r[i] * 3 + k]; rgb = o; }
-        }
-        // Older frames fade, so one bad frame cannot hold the average back for long.
-        for (let i = 0; i < n * 3; i++) a.sum[i] = a.sum[i] * 0.85 + rgb[i] * t.matched;
-        a.w = a.w * 0.85 + t.matched; a.frames++;
-        if (a.frames < 2) return null;
-        const mean = new Float32Array(n * 3);
-        for (let i = 0; i < n * 3; i++) mean[i] = a.sum[i] / a.w;
-        const res = decodeRGB(mean, t.L, t.p);
-        return res ? { ...res, pitch: t.p, matched: t.matched, frames: a.frames } : null;
-      },
-    };
-  }
 
-  // ---------- tile codes (the Free Scale sheet) ----------
-  // Luminance, bilinear, from a plane worked out once per frame.
-  let lumOf = null, lumPlane = null;
-  function lum(frame, W, H, x, y) {
-    if (lumOf !== frame) {
-      lumPlane = new Uint8Array(W * H);
-      for (let i = 0, o = 0; i < W * H; i++, o += 4) lumPlane[i] = (77 * frame[o] + 151 * frame[o + 1] + 28 * frame[o + 2]) >> 8;
-      lumOf = frame;
-    }
-    if (x < 0 || y < 0 || x >= W - 1 || y >= H - 1) return 255;
-    const X = x | 0, Y = y | 0, fx = x - X, fy = y - Y, o = Y * W + X, P = lumPlane;
+  // ---------- brightness ----------
+  function luma(frame, W, H) {
+    const P = new Uint8Array(W * H);
+    for (let i = 0, o = 0; i < W * H; i++, o += 4) P[i] = (77 * frame[o] + 151 * frame[o + 1] + 28 * frame[o + 2]) >> 8;
+    return { P, W, H };
+  }
+  function lum(L, x, y) {
+    if (x < 0 || y < 0 || x >= L.W - 1 || y >= L.H - 1) return 255;
+    const X = x | 0, Y = y | 0, fx = x - X, fy = y - Y, o = Y * L.W + X, P = L.P, W = L.W;
     const a = P[o] + (P[o + 1] - P[o]) * fx, b = P[o + W] + (P[o + W + 1] - P[o + W]) * fx;
     return a + (b - a) * fy;
   }
-  // Find the sheet: a region of ink (dark or strongly coloured pixels) held
-  // together by the dot grid, roughly a rectangle. Returns its four corners
-  // (long side first) in frame pixels.
-  function tileFind(frame, W, H) {
-    const DH = Math.round((DW * H) / W), sx = W / DW, m = new Uint8Array(DW * DH);
-    // Any ink in a block marks it, so the dots' thin outlines are not missed.
-    // Dark means clearly darker than the page's own white (a warm or dim page
-    // still counts as white).
-    const lo = new Uint8Array(DW * DH).fill(255), hi = new Uint8Array(DW * DH);
-    for (let y = 0; y < H; y++) {
-      const row = Math.min(DH - 1, (y / sx) | 0) * DW;
-      for (let x = 0, o = y * W * 4; x < W; x++, o += 4) {
-        const R = frame[o], G = frame[o + 1], B = frame[o + 2], mx = R > G ? (R > B ? R : B) : G > B ? G : B, mn = R < G ? (R < B ? R : B) : G < B ? G : B, q = row + Math.min(DW - 1, (x / sx) | 0);
-        if (mx < lo[q]) lo[q] = mx; if (mx > hi[q]) hi[q] = mx;
-        if (mx > 60 && mx - mn > mx * 0.4) m[q] = 1;
-      }
-    }
-    const sorted = hi.slice().sort(), paper = sorted[Math.floor(sorted.length * 0.9)];
-    for (let q = 0; q < m.length; q++) if (lo[q] < paper * 0.8) m[q] = 1;
-    // Frame edges are often dark (lens falloff, black bars): ignore a thin band.
-    for (let j = 0; j < DH; j++) for (let i = 0; i < DW; i++) if (i < 2 || j < 2 || i >= DW - 2 || j >= DH - 2) m[j * DW + i] = 0;
-    close(m, DW, DH, 7);
-    // Fill holes: white areas inside the sheet belong to it.
-    { const out = new Uint8Array(DW * DH), st = [];
-      for (let i = 0; i < DW; i++) for (const j of [0, DH - 1]) { const q = j * DW + i; if (!m[q] && !out[q]) { out[q] = 1; st.push(q); } }
-      for (let j = 0; j < DH; j++) for (const i of [0, DW - 1]) { const q = j * DW + i; if (!m[q] && !out[q]) { out[q] = 1; st.push(q); } }
-      while (st.length) { const q = st.pop(), x = q % DW, y = (q / DW) | 0; for (const k of [x > 0 ? q - 1 : -1, x < DW - 1 ? q + 1 : -1, y > 0 ? q - DW : -1, y < DH - 1 ? q + DW : -1]) if (k >= 0 && !m[k] && !out[k]) { out[k] = 1; st.push(k); } }
-      for (let q = 0; q < m.length; q++) if (!out[q]) m[q] = 1; }
-    const lab = new Int32Array(DW * DH), stack = [];
-    let best = null, next = 1;
-    for (let p = 0; p < m.length; p++) {
-      if (!m[p] || lab[p]) continue;
-      const pts = []; lab[p] = next; stack.push(p);
-      while (stack.length) {
-        const q = stack.pop(), x = q % DW, y = (q / DW) | 0; pts.push(q);
-        if (x > 0 && m[q - 1] && !lab[q - 1]) { lab[q - 1] = next; stack.push(q - 1); }
-        if (x < DW - 1 && m[q + 1] && !lab[q + 1]) { lab[q + 1] = next; stack.push(q + 1); }
-        if (y > 0 && m[q - DW] && !lab[q - DW]) { lab[q - DW] = next; stack.push(q - DW); }
-        if (y < DH - 1 && m[q + DW] && !lab[q + DW]) { lab[q + DW] = next; stack.push(q + DW); }
-      }
-      next++;
-      if (pts.length < DW * DH * 0.03 || (best && pts.length < best.length)) continue;
-      best = pts;
-    }
-    if (!best) return null;
-    // Principal axes, then the extreme point along each diagonal: the corners.
-    let mx = 0, my = 0; for (const q of best) { mx += q % DW; my += (q / DW) | 0; } mx /= best.length; my /= best.length;
-    let cxx = 0, cyy = 0, cxy = 0; for (const q of best) { const dx = (q % DW) - mx, dy = ((q / DW) | 0) - my; cxx += dx * dx; cyy += dy * dy; cxy += dx * dy; }
-    const th = 0.5 * Math.atan2(2 * cxy, cxx - cyy), c = Math.cos(th), sn = Math.sin(th);
-    let su = 0, sv = 0; for (const q of best) { const dx = (q % DW) - mx, dy = ((q / DW) | 0) - my; su = Math.max(su, Math.abs(dx * c + dy * sn)); sv = Math.max(sv, Math.abs(-dx * sn + dy * c)); }
-    const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => {
-      let bq = best[0], bs = -Infinity;
-      for (const q of best) { const dx = (q % DW) - mx, dy = ((q / DW) | 0) - my, u = (dx * c + dy * sn) / su, v = (-dx * sn + dy * c) / sv, sc = a * u + b * v; if (sc > bs) { bs = sc; bq = q; } }
-      return [((bq % DW) + 0.5) * sx, (((bq / DW) | 0) + 0.5) * sx];
-    });
-    const side = (a, b) => Math.hypot(corners[a][0] - corners[b][0], corners[a][1] - corners[b][1]);
-    const quad = Math.abs(corners.reduce((a, p, i) => { const q = corners[(i + 1) % 4]; return a + p[0] * q[1] - q[0] * p[1]; }, 0)) / 2 / (sx * sx);
-    const aspect = (side(0, 1) + side(2, 3)) / (side(1, 2) + side(3, 0));
-    // A rectangle fills the quad through its corners; an oval overfills it by half.
-    const fill = best.length / quad;
-    if (fill < 0.8 || fill > 1.2 || aspect < 1.3 || aspect > 2.6) return null;
-    return { corners, area: best.length * sx * sx };
-  }
-  // How much a spot looks like one of the grid's dots, of radius rp pixels:
-  // a dark disc on lighter ground, a light centre inside a dark ring, or a
-  // light disc on darker ground.
+  // How much a spot looks like one of the grid's dots of radius rp: a dark
+  // disc on lighter ground, a light centre inside a dark ring, or a light
+  // disc on darker ground.
   const RING = Array.from({ length: 8 }, (_, k) => [Math.cos((k / 8) * TAU), Math.sin((k / 8) * TAU)]);
-  function dotScore(frame, W, H, x, y, rp) {
-    const c = lum(frame, W, H, x, y), r1 = rp * 0.85, r2 = rp * 1.9;
+  function dotScore(L, x, y, rp) {
+    const c = lum(L, x, y), r1 = rp * 0.85, r2 = rp * 1.9;
     let ring = 0, out = 0;
-    for (const [ca, sa] of RING) { ring += lum(frame, W, H, x + ca * r1, y + sa * r1); out += lum(frame, W, H, x + ca * r2, y + sa * r2); }
+    for (const [ca, sa] of RING) { ring += lum(L, x + ca * r1, y + sa * r1); out += lum(L, x + ca * r2, y + sa * r2); }
     ring /= 8; out /= 8;
     return Math.max(out - (c + ring) / 2, Math.min(c, out) - ring, c - (ring + out) / 2);
   }
-  // Lock the dot grid. The finder's corners are only rough (the plain white
-  // dots at the edges can be too faint to count as ink), so this starts in
-  // the middle, where a rough guess is still close, and grows outward: each
-  // predicted dot moves to the best dot nearby and the perspective is refitted.
-  // Then it looks for where the dots stop, which fixes the edges exactly.
-  function tileRegister(frame, W, H, found) {
-    const T = TILECODE, g = [[0, 0], [T.NX - 1, 0], [T.NX - 1, T.NY - 1], [0, T.NY - 1]];
-    const canon = g.map(([i, j]) => { const [x, y] = T.dotXY(i, j); return [x + (i ? 1 : -1) * T.DOT_R, y + (j ? 1 : -1) * T.DOT_R]; });
-    let Hm = fitH(canon.map((p, k) => [p[0], p[1], found.corners[k][0], found.corners[k][1]]));
-    if (!Hm) return null;
-    const ci = (T.NX - 1) / 2, cj = (T.NY - 1) / 2, PAD = 5;
-    // The best dot near where (i, j) is predicted, as [x, y, score].
-    const seek = (i, j, reach, n = 4) => {
-      const cx = T.M + i * T.STEP, cy = T.M + j * T.STEP, [x, y] = applyH(Hm, cx, cy), [x2, y2] = applyH(Hm, cx + T.STEP, cy);
-      const step = Math.hypot(x2 - x, y2 - y), rp = Math.max(1, T.DOT_R * (step / T.STEP));
-      if (!reach) return [cx, cy, x, y, dotScore(frame, W, H, x, y, rp)];
+
+  // ---------- blobs ----------
+  // Small dark or light blobs in a box of the frame, at a few sizes: centre
+  // against surround, from an integral image. Returns [x, y, strength].
+  function blobs(L, x0, y0, w, h) {
+    const I = new Uint32Array((w + 1) * (h + 1)), W1 = w + 1;
+    for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += L.P[(y0 + y) * L.W + x0 + x]; I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + row; } }
+    const sum = (xa, ya, xb, yb) => I[(yb + 1) * W1 + xb + 1] - I[ya * W1 + xb + 1] - I[(yb + 1) * W1 + xa] + I[ya * W1 + xa];
+    const found = [];
+    for (const r of [1, 2, 3, 4]) {
+      const b = 2 * r + 1, st = r < 2 ? 1 : 2, nIn = (2 * r + 1) ** 2, nOut = (2 * b + 1) ** 2 - nIn;
+      const gw = Math.floor((w - 2 * b) / st), gh = Math.floor((h - 2 * b) / st);
+      if (gw < 3 || gh < 3) continue;
+      const R = new Float32Array(gw * gh);
+      for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+        const x = b + gx * st, y = b + gy * st, inner = sum(x - r, y - r, x + r, y + r);
+        R[gy * gw + gx] = (sum(x - b, y - b, x + b, y + b) - inner) / nOut - inner / nIn;
+      }
+      for (let gy = 1; gy < gh - 1; gy++) for (let gx = 1; gx < gw - 1; gx++) {
+        const v = R[gy * gw + gx], a = Math.abs(v);
+        if (a < 14) continue;
+        let peak = true;
+        for (let dy = -1; dy <= 1 && peak; dy++) for (let dx = -1; dx <= 1; dx++) if ((dx || dy) && Math.abs(R[(gy + dy) * gw + gx + dx]) > a) { peak = false; break; }
+        if (!peak) continue;
+        // A blob, not an edge or a corner: darker (or lighter) than every
+        // point on a ring around it.
+        const px = x0 + b + gx * st, py = y0 + b + gy * st, c = lum(L, px, py), rr = 1.6 * r + 0.5;
+        let lo = 255, hiv = 0;
+        for (const [ca, sa] of RING) { const t = lum(L, px + ca * rr, py + sa * rr); if (t < lo) lo = t; if (t > hiv) hiv = t; }
+        if (v > 0 ? lo - c < a * 0.5 : c - hiv < a * 0.5) continue;
+        found.push([px, py, a, r]);
+      }
+    }
+    // Strongest first; one blob per spot across sizes.
+    found.sort((p, q) => q[2] - p[2]);
+    const kept = [], cell = 4, grid = new Map(), key = (x, y) => Math.floor(x / cell) * 65536 + Math.floor(y / cell);
+    for (const p of found) {
+      const rr = Math.max(2, p[3]); let near = false;
+      for (let dx = -2; dx <= 2 && !near; dx++) for (let dy = -2; dy <= 2 && !near; dy++) for (const q of grid.get(key(p[0] + dx * cell, p[1] + dy * cell)) || []) if (Math.hypot(q[0] - p[0], q[1] - p[1]) < rr) { near = true; break; }
+      if (near) continue;
+      kept.push(p); const k = key(p[0], p[1]); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(p);
+      if (kept.length >= 2500) break;
+    }
+    return kept;
+  }
+  // The grid's two step vectors: the displacements that occur most often
+  // between each blob and its nearest neighbours.
+  function lattice(cands, maxStep) {
+    const R = Math.ceil(maxStep), S = 2 * R + 1, hist = new Float32Array(S * S), cell = maxStep, grid = new Map();
+    const key = (x, y) => Math.floor(x / cell) * 65536 + Math.floor(y / cell);
+    for (const p of cands) { const k = key(p[0], p[1]); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(p); }
+    for (const p of cands) {
+      const near = [];
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (const q of grid.get(key(p[0] + dx * cell, p[1] + dy * cell)) || []) {
+        const ex = q[0] - p[0], ey = q[1] - p[1], d = Math.hypot(ex, ey);
+        if (d >= 4 && d <= maxStep) near.push([d, ex, ey]);
+      }
+      near.sort((a, b) => a[0] - b[0]);
+      for (const [, ex, ey] of near.slice(0, 10)) hist[(Math.round(ey) + R) * S + Math.round(ex) + R] += 1;
+    }
+    // Smooth, then peaks.
+    const sm = new Float32Array(S * S);
+    for (let y = 1; y < S - 1; y++) for (let x = 1; x < S - 1; x++) { let t = 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) t += hist[(y + dy) * S + x + dx]; sm[y * S + x] = t; }
+    const peaks = [];
+    for (let y = 2; y < S - 2; y++) for (let x = 2; x < S - 2; x++) {
+      const v = sm[y * S + x], dx = x - R, dy = y - R;
+      if (v < 6 || Math.hypot(dx, dy) < 4) continue;
+      let peak = true; for (let a = -2; a <= 2 && peak; a++) for (let b = -2; b <= 2; b++) if ((a || b) && sm[(y + a) * S + x + b] > v) { peak = false; break; }
+      if (peak) peaks.push([dx, dy, v]);
+    }
+    if (peaks.length < 2) return null;
+    peaks.sort((a, b) => b[2] - a[2]);
+    const top = peaks[0][2], len = (p) => Math.hypot(p[0], p[1]);
+    const strong = peaks.filter((p) => p[2] >= top * 0.45);
+    const u = strong.reduce((a, p) => (len(p) < len(a) ? p : a));
+    const angle = (p) => { const c = (u[0] * p[0] + u[1] * p[1]) / (len(u) * len(p)); return (Math.acos(Math.max(-1, Math.min(1, c))) * 180) / Math.PI; };
+    const vs = peaks.filter((p) => p[2] >= top * 0.3 && angle(p) > 55 && angle(p) < 125 && len(p) > len(u) * 0.6 && len(p) < len(u) * 1.6);
+    if (!vs.length) return null;
+    const v = vs.reduce((a, p) => (len(p) < len(a) ? p : a));
+    // Refine each peak to the centre of its votes.
+    const refine = (p) => { let sx = 0, sy = 0, n = 0; for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const x = p[0] + dx, y = p[1] + dy, c = hist[(y + R) * S + x + R] || 0; sx += x * c; sy += y * c; n += c; } return n ? [sx / n, sy / n] : [p[0], p[1]]; };
+    let U = refine(u), V = refine(v);
+    if (U[0] * V[1] - U[1] * V[0] < 0) V = [-V[0], -V[1]]; // keep the image's handedness
+    return { u: U, v: V, support: [u[2], v[2]] };
+  }
+
+  // ---------- following the grid ----------
+  // From a seed dot and the two step vectors, the grid in local indices
+  // (a, b) → frame pixels, as a homography. Then the sheet's place in it.
+  function follow(L, seed, u, v, dbg) {
+    let Hm = [u[0], v[0], seed[0], u[1], v[1], seed[1], 0, 0, 1];
+    const stepPx = (a, b) => { const [x, y] = applyH(Hm, a, b), [x2, y2] = applyH(Hm, a + 1, b), [x3, y3] = applyH(Hm, a, b + 1); return [x, y, (Math.hypot(x2 - x, y2 - y) + Math.hypot(x3 - x, y3 - y)) / 2]; };
+    const seek = (a, b, reach, n = 4) => {
+      const [x, y, step] = stepPx(a, b), rp = Math.max(1, T.DOT_R * (step / T.STEP));
+      if (x < 2 || y < 2 || x > L.W - 3 || y > L.H - 3) return null;
+      if (!reach) return [a, b, x, y, dotScore(L, x, y, rp)];
       const r = Math.max(1, reach * step), st = Math.max(0.5, r / n);
       let bs = -Infinity, bx = x, by = y;
-      for (let dy = -r; dy <= r + 1e-6; dy += st) for (let dx = -r; dx <= r + 1e-6; dx += st) { const sc = dotScore(frame, W, H, x + dx, y + dy, rp); if (sc > bs) { bs = sc; bx = x + dx; by = y + dy; } }
-      return [cx, cy, bx, by, bs];
+      for (let dy = -r; dy <= r + 1e-6; dy += st) for (let dx = -r; dx <= r + 1e-6; dx += st) { const sc = dotScore(L, x + dx, y + dy, rp); if (sc > bs) { bs = sc; bx = x + dx; by = y + dy; } }
+      return [a, b, bx, by, bs];
     };
-    const fit = (pairs, affine) => {
-      if (pairs.length < (affine ? 12 : 30)) return false;
-      pairs.sort((a, b) => b[4] - a[4]);
+    const trimFit = (pairs, affine) => {
+      if (pairs.length < (affine ? 8 : 24)) return false;
+      pairs.sort((p, q) => q[4] - p[4]);
       let use = pairs.slice(0, Math.ceil(pairs.length * 0.85));
-      const f = affine ? fitA : fitH, H2 = f(use); if (!H2) return false;
-      use = use.map((p) => { const [u, v] = applyH(H2, p[0], p[1]); return [...p, Math.hypot(u - p[2], v - p[3])]; }).sort((a, b) => a[5] - b[5]).slice(0, Math.ceil(use.length * 0.85));
-      Hm = f(use) || H2; return true;
+      const f = affine ? fitA : fitH, H1 = f(use); if (!H1) return false;
+      use = use.map((p) => { const [x, y] = applyH(H1, p[0], p[1]); return [...p, Math.hypot(x - p[2], y - p[3])]; }).sort((p, q) => p[5] - q[5]).slice(0, Math.ceil(use.length * 0.85));
+      Hm = f(use) || H1; return true;
     };
-    // How well a mapping fits the whole grid: the dot evidence at every dot.
-    const quality = () => { let t = 0; for (let j = 0; j < T.NY; j++) for (let i = 0; i < T.NX; i++) t += Math.max(0, seek(i, j, 0.06, 1)[4]); return t; };
-    // The rough start can be off by part of a step: try shifts of the whole
-    // grid across one step and keep the one where the middle dots fit best.
-    {
-      const [x0, y0] = applyH(Hm, T.M + ci * T.STEP, T.M + cj * T.STEP), [x1, y1] = applyH(Hm, T.M + (ci + 1) * T.STEP, T.M + cj * T.STEP), [x2, y2] = applyH(Hm, T.M + ci * T.STEP, T.M + (cj + 1) * T.STEP);
-      const ux = x1 - x0, uy = y1 - y0, vx = x2 - x0, vy = y2 - y0, H0 = Hm.slice();
-      let best = -Infinity, bu = 0, bv = 0;
-      for (let a = -0.5; a < 0.5; a += 0.125) for (let b = -0.5; b < 0.5; b += 0.125) {
-        const dx = a * ux + b * vx, dy = a * uy + b * vy;
-        Hm = [H0[0] + dx * H0[6], H0[1] + dx * H0[7], H0[2] + dx * H0[8], H0[3] + dy * H0[6], H0[4] + dy * H0[7], H0[5] + dy * H0[8], H0[6], H0[7], H0[8]];
-        let t = 0; for (let j = cj - 3; j <= cj + 3; j++) for (let i = ci - 5; i <= ci + 5; i++) t += Math.max(0, seek(i, j, 0)[4]);
-        if (t > best) { best = t; bu = dx; bv = dy; }
-      }
-      Hm = [H0[0] + bu * H0[6], H0[1] + bu * H0[7], H0[2] + bu * H0[8], H0[3] + bv * H0[6], H0[4] + bv * H0[7], H0[5] + bv * H0[8], H0[6], H0[7], H0[8]];
+    // Grow outward over the dots actually found, never far past them.
+    let lo = [-2, -2], hi = [2, 2];
+    const THR = 16;
+    for (const [rad, reach, affine, n] of [[2, 0.3, true, 4], [4, 0.25, true, 4], [7, 0.22, false, 4], [11, 0.18, false, 3], [18, 0.15, false, 3], [36, 0.12, false, 3]]) {
+      const pairs = [], a0 = Math.max(-rad, lo[0] - 3), a1 = Math.min(rad, hi[0] + 3), b0 = Math.max(-rad, lo[1] - 3), b1 = Math.min(rad, hi[1] + 3);
+      for (let b = b0; b <= b1; b++) for (let a = a0; a <= a1; a++) { const p = seek(a, b, reach, n); if (p && p[4] > THR) pairs.push(p); }
+      if (!trimFit(pairs, affine)) return null;
+      lo = [Math.min(...pairs.map((p) => p[0])), Math.min(...pairs.map((p) => p[1]))];
+      hi = [Math.max(...pairs.map((p) => p[0])), Math.max(...pairs.map((p) => p[1]))];
+      if (dbg) dbg.stages = (dbg.stages || 0) + 1;
     }
-    let q = quality();
-    for (const [rad, reach, affine] of [[4, 0.25, true], [7, 0.22, false], [11, 0.18, false], [30, 0.14, false], [30, 0.1, false]]) {
-      const pairs = [], keep = Hm;
-      for (let j = Math.ceil(cj - rad); j <= Math.floor(cj + rad); j++) for (let i = Math.ceil(ci - rad * 1.8); i <= Math.floor(ci + rad * 1.8); i++) {
-        if (i < -1 || j < -1 || i > T.NX || j > T.NY) continue;
-        const p = seek(i, j, reach); if (p[4] > 18) pairs.push(p);
-      }
-      // A step is kept only if the whole grid fits better than before.
-      if (fit(pairs, affine)) { const q2 = quality(); if (q2 > q) q = q2; else Hm = keep; }
+    // Where do the dots stop? The sheet is the NX × NY window (either way
+    // round) holding the most dot evidence.
+    const A0 = lo[0] - 3, B0 = lo[1] - 3, nA = hi[0] - lo[0] + 7, nB = hi[1] - lo[1] + 7;
+    const E = new Float64Array((nA + 1) * (nB + 1)); // prefix sums
+    for (let j = 0; j < nB; j++) for (let i = 0; i < nA; i++) {
+      const p = seek(A0 + i, B0 + j, 0.07, 1), e = p ? Math.max(0, p[4]) : 0;
+      E[(j + 1) * (nA + 1) + i + 1] = e + E[j * (nA + 1) + i + 1] + E[(j + 1) * (nA + 1) + i] - E[j * (nA + 1) + i];
     }
-    // Where do the dots stop? Evidence per column and row over a padded range;
-    // the sheet is the NX × NY window holding the most.
-    const cols = new Float64Array(T.NX + 2 * PAD), rows = new Float64Array(T.NY + 2 * PAD);
-    for (let j = -PAD; j < T.NY + PAD; j++) for (let i = -PAD; i < T.NX + PAD; i++) { const sc = Math.max(0, seek(i, j, 0.06, 1)[4]); cols[i + PAD] += sc; rows[j + PAD] += sc; }
-    const window = (a, n) => { let best = 0, bs = -1; for (let o = 0; o + n <= a.length; o++) { let t = 0; for (let k = 0; k < n; k++) t += a[o + k]; if (t > bs) { bs = t; best = o; } } return best - PAD; };
-    const di = window(cols, T.NX), dj = window(rows, T.NY);
-    // Re-index so that (di, dj) becomes dot (0, 0).
-    const S = [1, 0, di * T.STEP, 0, 1, dj * T.STEP, 0, 0, 1], mul = (P, Q) => Array.from({ length: 9 }, (_, k) => P[((k / 3) | 0) * 3] * Q[k % 3] + P[((k / 3) | 0) * 3 + 1] * Q[3 + (k % 3)] + P[((k / 3) | 0) * 3 + 2] * Q[6 + (k % 3)]);
-    return { H: mul(Hm, S), shift: [di, dj] };
+    const box = (i, j, w, h) => E[(j + h) * (nA + 1) + i + w] - E[j * (nA + 1) + i + w] - E[(j + h) * (nA + 1) + i] + E[j * (nA + 1) + i];
+    const best = (w, h) => { let bs = -1, bi = 0, bj = 0; for (let j = 0; j + h <= nB; j++) for (let i = 0; i + w <= nA; i++) { const s = box(i, j, w, h); if (s > bs) { bs = s; bi = i; bj = j; } } return { s: bs, a: A0 + bi, b: B0 + bj }; };
+    const wide = best(T.NX, T.NY), tall = best(T.NY, T.NX);
+    const Q = wide.s >= tall.s
+      // Long side along a: dot (i, j) is (a + i, b + j).
+      ? [1 / T.STEP, 0, wide.a - T.M / T.STEP, 0, 1 / T.STEP, wide.b - T.M / T.STEP, 0, 0, 1]
+      // Long side along b: dot (i, j) is (a + NY − 1 − j, b + i).
+      : [0, -1 / T.STEP, tall.a + T.NY - 1 + T.M / T.STEP, 1 / T.STEP, 0, tall.b - T.M / T.STEP, 0, 0, 1];
+    return { H: mul(Hm, Q), evidence: Math.max(wide.s, tall.s) };
+  }
+
+  // ---------- one frame ----------
+  // Returns { found, H, dark } or { found: false }.
+  function look(frame, W, H, dbg) {
+    const L = luma(frame, W, H), side = Math.min(W, H);
+    // Blobs in a box around the middle, where the camera is pointed.
+    const bw = Math.round(Math.min(W, side * 0.65)), bh = Math.round(Math.min(H, side * 0.65)), x0 = Math.round((W - bw) / 2), y0 = Math.round((H - bh) / 2);
+    const cands = blobs(L, x0, y0, bw, bh);
+    if (dbg) dbg.blobs = cands.length;
+    if (cands.length < 40) return { found: false };
+    const lat = lattice(cands, side / 18);
+    if (!lat) return { found: false };
+    const step = Math.hypot(...lat.u);
+    if (dbg) dbg.step = Math.round(step);
+    // Seed: the blob nearest the middle that has grid neighbours around it.
+    const cell = step, grid = new Map(), key = (x, y) => Math.floor(x / cell) * 65536 + Math.floor(y / cell);
+    for (const p of cands) { const k = key(p[0], p[1]); if (!grid.has(k)) grid.set(k, []); grid.get(k).push(p); }
+    const has = (x, y) => { for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (const q of grid.get(key(x + dx * cell, y + dy * cell)) || []) if (Math.hypot(q[0] - x, q[1] - y) < step * 0.22) return true; return false; };
+    const cx = W / 2, cy = H / 2, { u, v } = lat;
+    let seed = null, bestScore = -1;
+    for (const p of cands) {
+      const d = Math.hypot(p[0] - cx, p[1] - cy); if (d > side * 0.3) continue;
+      let n = 0; for (const [a, b] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) if (has(p[0] + a * u[0] + b * v[0], p[1] + a * u[1] + b * v[1])) n++;
+      const sc = n - d / side;
+      if (sc > bestScore) { bestScore = sc; seed = p; }
+    }
+    if (!seed || bestScore < 3) return { found: false };
+    const got = follow(L, seed, u, v, dbg);
+    if (!got) return { found: false };
+    return { found: true, H: got.H, dark: darkness(L, got.H) };
   }
   // Each dot's darkness: 255 minus the brightness of its middle.
-  function tileDarkness(frame, W, H, Hm) {
-    const T = TILECODE, dark = new Float32Array(T.NX * T.NY);
+  function darkness(L, Hm) {
+    const dark = new Float32Array(T.NX * T.NY);
     for (let j = 0; j < T.NY; j++) for (let i = 0; i < T.NX; i++) {
       const [cx, cy] = T.dotXY(i, j), [x, y] = applyH(Hm, cx, cy), [x2, y2] = applyH(Hm, cx + T.STEP, cy), rp = T.DOT_R * (Math.hypot(x2 - x, y2 - y) / T.STEP) * 0.35;
-      dark[j * T.NX + i] = 255 - (lum(frame, W, H, x, y) * 2 + lum(frame, W, H, x + rp, y) + lum(frame, W, H, x - rp, y) + lum(frame, W, H, x, y + rp) + lum(frame, W, H, x, y - rp)) / 6;
+      dark[j * T.NX + i] = 255 - (lum(L, x, y) * 2 + lum(L, x + rp, y) + lum(L, x - rp, y) + lum(L, x, y + rp) + lum(L, x, y - rp)) / 6;
     }
     return dark;
   }
-  // One frame, start to finish (used for photos): the ID, or null.
-  function tileRead(frame, W, H) {
-    const found = tileFind(frame, W, H); if (!found) return null;
-    const reg = tileRegister(frame, W, H, found); if (!reg) return null;
-    const res = TILECODE.readDots(tileDarkness(frame, W, H, reg.H));
-    return res ? { ...res, found } : null;
-  }
-  // Averages dot darkness over frames, lined up for the two ways up.
-  function tileAverager() {
-    let sum = null, w = 0;
-    return {
-      reset() { sum = null; w = 0; },
-      add(dark) {
-        if (sum) {
-          const n = dark.length; let same = 0, turned = 0;
-          for (let i = 0; i < n; i++) { const m = sum[i] / w; same += (dark[i] - m) ** 2; turned += (dark[n - 1 - i] - m) ** 2; }
-          if (turned < same) dark = dark.slice().reverse();
-        } else sum = new Float32Array(dark.length);
-        for (let i = 0; i < dark.length; i++) sum[i] = sum[i] * 0.8 + dark[i];
-        w = w * 0.8 + 1;
-        return TILECODE.readDots(sum.map((v) => v / w));
-      },
-    };
+  // A single still (tests, photos): the ID, or null.
+  function read(frame, W, H) {
+    const r = look(frame, W, H);
+    return r.found ? T.readDots(r.dark) : null;
   }
 
   // ---------- a scanning session ----------
-  // Feed frames; it keeps votes while the code holds still and reports once sure.
+  // Dot darkness is averaged over frames (noise and compression change from
+  // frame to frame, the code does not), lined up for the two ways up. A frame
+  // that doesn't match the average at all means a different code: start over.
   function session() {
-    let acc = null, last = null, n = 0, gone = 0, tileGone = 0;
-    const avg = imageAverager(), tiles = window.TILECODE ? tileAverager() : null;
+    let sum = null, w = 0, miss = 0;
+    const reset = () => { sum = null; w = 0; };
     return {
-      reset() { acc = null; last = null; n = 0; avg.reset(); tiles?.reset(); },
-      frame(frame, W, H, { tryImage = false, pitches = [7], mirrors = [false], steady = 0 } = {}) {
-        // The current code: the Free Scale sheet, whose dots carry an ID.
-        const sheet = tiles && tileFind(frame, W, H);
-        if (sheet) {
-          tileGone = 0;
-          const reg = tileRegister(frame, W, H, sheet);
-          if (reg) {
-            const res = tiles.add(tileDarkness(frame, W, H, reg.H));
-            if (res) return { found: true, sheet, kind: 'tile', id: res.id };
-          }
-        } else if (tiles && ++tileGone > 8) tiles.reset();
-        // Older codes: the oval.
-        const E = detect(frame, W, H);
-        if (!E) { acc = null; last = null; if (++gone > 8) avg.reset(); return sheet ? { found: true, sheet } : { found: false }; }
-        gone = 0;
-        const moved = last && (Math.hypot(E.cx - last.cx, E.cy - last.cy) > E.a * 0.06 || Math.abs(E.a - last.a) > E.a * 0.06);
-        if (!acc || moved) { acc = [Array.from({ length: 48 }, () => [0, 0, 0]), Array.from({ length: 48 }, () => [0, 0, 0])]; n = 0; }
-        last = E; n++;
-        for (const mirror of [0, 1]) {
-          const v = linkVotes(frame, W, H, E, !!mirror);
-          v.forEach((c, i) => { for (let k = 0; k < 3; k++) acc[mirror][i][k] = acc[mirror][i][k] * 0.85 + c[k]; });
-          const res = decodeVotes(acc[mirror]);
-          if (res.ok && res.disagreements <= 3) return { found: true, E, kind: 'link', id: res.id, frames: n };
+      reset,
+      frame(frame, W, H, dbg) {
+        const r = look(frame, W, H, dbg);
+        if (!r.found) { if (++miss > 6) reset(); return { found: false }; }
+        miss = 0;
+        const one = T.readDots(r.dark);
+        if (one) { reset(); return { found: true, id: one.id }; }
+        let dark = r.dark;
+        if (sum) {
+          const n = dark.length; let same = 0, turned = 0, mean = 0;
+          for (let i = 0; i < n; i++) mean += sum[i] / w; mean /= n;
+          for (let i = 0; i < n; i++) { const m = sum[i] / w - mean; same += (dark[i] - mean) * m; turned += (dark[n - 1 - i] - mean) * m; }
+          if (turned > same) dark = dark.slice().reverse();
+          if (Math.max(same, turned) <= 0) reset();
         }
-        if (tryImage && n > steady) {
-          const img = avg.add(frame, W, H, E, pitches, mirrors);
-          if (img) return { found: true, E, kind: 'image', image: img };
-        }
-        return { found: true, E, frames: n };
+        if (!sum) sum = new Float32Array(dark.length);
+        for (let i = 0; i < dark.length; i++) sum[i] = sum[i] * 0.8 + dark[i];
+        w = w * 0.8 + 1;
+        const avg = T.readDots(sum.map((x) => x / w));
+        if (avg) { reset(); return { found: true, id: avg.id }; }
+        return { found: true };
       },
     };
   }
 
-  window.SCAN = { detect, session, imageRead, tileRead, _tileFind: tileFind, _tileRegister: tileRegister, _tileDarkness: tileDarkness, PITCHES_ALL, hueClass, _fitH: fitH, _beadBlobs: beadBlobs, _register: register, _startH: startH, _applyH: applyH, _beadColours: beadColours, _beadRGB: beadRGB, _registerAll: registerAll, _voidCentre: voidCentre, _project: project };
+  window.SCAN = { session, read, _look: look, _blobs: blobs, _lattice: lattice, _luma: luma, _fitH: fitH, _applyH: applyH };
 })();

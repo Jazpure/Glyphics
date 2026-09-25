@@ -1,23 +1,15 @@
 // Reads codes off the page's main thread, so the camera view never stutters.
-// Messages in: { frame | photo, px (RGBA buffer), W, H, opts } or { reset }.
-// Messages out: the session's result for that frame.
+// Messages in: { id, px (RGBA buffer), W, H } or { reset }.
+// Messages out: { id, r } with r = { found, id?, dbg }.
 self.window = self;
 const v = self.location.search;
-importScripts(`../sketches/lib.js${v}`, `../sketches/kit.js${v}`, `../sketches/r8/code.js${v}`, `../app/rs.js${v}`, `../app/imagecode.js${v}`, `../app/tilecode.js${v}`, `scan.js${v}`);
+importScripts(`../sketches/lib.js${v}`, `../app/rs.js${v}`, `../app/tilecode.js${v}`, `scan.js${v}`);
 
-let live = SCAN.session();
+const live = SCAN.session();
 self.onmessage = ({ data: m }) => {
   if (m.reset) { live.reset(); return; }
+  const dbg = {};
   let r;
-  try {
-    const px = new Uint8ClampedArray(m.px);
-    if (m.photo) {
-      // A still: no motion to wait for, so try every pitch and a mirror image too.
-      const one = SCAN.session();
-      for (let k = 0; k < 3 && !(r && r.kind); k++) r = one.frame(px, m.W, m.H, { tryImage: k === 0, pitches: [7, 10, 8, 9], mirrors: [false, true], steady: 0 });
-    } else r = live.frame(px, m.W, m.H, m.opts);
-  } catch (err) {
-    r = { found: false, error: String(err && err.message) };
-  }
-  self.postMessage({ id: m.id, r });
+  try { r = live.frame(new Uint8ClampedArray(m.px), m.W, m.H, dbg); } catch (err) { r = { found: false }; dbg.error = String(err && err.message); }
+  self.postMessage({ id: m.id, r: { ...r, dbg } });
 };
