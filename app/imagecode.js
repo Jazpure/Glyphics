@@ -15,10 +15,14 @@
    mask so plain images never make plain patterns. The header holds size, bit
    depths, length and a CRC-32 of the image bytes: a read is right or refused.
 
-   Image codec. A small JPEG: YCbCr 4:2:0, 8 × 8 DCT blocks, the standard
-   quantisation tables scaled by a quality, and Exp-Golomb coding of the
-   coefficients. The encoder picks the largest resolution that still fits at a
-   decent quality, so a code holds several times more pixels than raw colour. */
+   Image codecs, chosen per image:
+   1  photos: a small JPEG (YCbCr 4:2:0, 8 × 8 DCT, the standard quantisation
+      tables scaled by a quality, Exp-Golomb coefficients)
+   2  drawings, logos, text: up to 16 flat colours, each pixel predicted from
+      the one above (or, after a change, the one to its left); runs of correct
+      predictions cost a few bits, so flat areas are nearly free and edges stay
+      sharp
+   Either way the encoder picks the largest resolution that fits. */
 (function () {
   const { TAU, O, ovalPath, paper } = window.GL;
   const { beadPath } = window.STRANDS;
@@ -27,7 +31,7 @@
   const BLACK = '#0a0a0a';
   const SOLID = ['circle', 'circle', 'squircle', 'pill', 'diamond', 'hex', 'oct', 'pent', 'tri3', 'star', 'star4', 'star8', 'flower', 'cog', 'burst', 'drop', 'kite', 'lens', 'cross', 'trefoil', 'quatrefoil', 'blobby', 'arch'];
   const RHYTHM = [1, 0.7, 1.35, 0.8, 1.75, 0.72, 1.15, 0.62, 1.5, 0.9, 2.0, 0.75];
-  const MAGIC = 0x47, VERSION = 1, CODEC = 1, HEADER = 12, PARITY = 0.18, MIN_Q = 35;
+  const MAGIC = 0x47, VERSION = 1, HEADER = 12, PARITY = 0.18, MIN_Q = 35, FLAT_MSE = 160;
 
   // ---------- lattice ----------
   function lattice(pitch = 11) {
@@ -142,7 +146,7 @@
   }
   // The largest resolution (multiples of 16, ≤ 240) whose best quality that
   // fits is at least MIN_Q; failing that, the best that fits at all.
-  function encodeImage(img, bits) {
+  function encodeDCT(img, bits) {
     const aspect = clamp(img.width / img.height, 0.5, 2.2), bytes = Math.floor(bits / 8);
     const dims = (w) => [w, Math.max(16, Math.round(w / aspect / 16) * 16)];
     let best = null, w = Math.min(240, Math.ceil(Math.sqrt((bits / 0.9) * aspect) / 16) * 16);
@@ -152,13 +156,13 @@
       const pl = planes(img, W, H);
       let lo = 5, hi = 95, got = null;
       while (lo <= hi) { const q = (lo + hi) >> 1, b = compress(pl, W, H, q); if (b.length <= bytes) { got = { w: W, h: H, q, bytes: b }; lo = q + 1; } else hi = q - 1; }
-      if (got && got.q >= MIN_Q) return got;
+      if (got && got.q >= MIN_Q) return { ...got, codec: 1 };
       if (got && (!best || got.q > best.q)) best = got;
     }
     if (!best) throw new Error('image does not fit');
-    return best;
+    return { ...best, codec: 1 };
   }
-  function decodeImage({ w, h, q, bytes }) {
+  function decodeDCT({ w, h, q, bytes }) {
     const inb = new Bits(Array.from(bytes)), qy = qtable(QY, q), qc = qtable(QC, q), cw = w / 2;
     const Y = getPlane(inb, w, h, qy), Cb = getPlane(inb, cw, h / 2, qc), Cr = getPlane(inb, cw, h / 2, qc);
     const img = new ImageData(w, h);
@@ -173,10 +177,99 @@
     return img;
   }
 
+
+  // ---------- flat-colour codec ----------
+  // The source at w × h (cover-cropped), as RGBA.
+  function pixelsAt(img, w, h) {
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const x = c.getContext('2d', { willReadFrequently: true }), sw = Math.min(img.width, img.height * (w / h)), sh = sw * (h / w);
+    x.imageSmoothingQuality = 'high';
+    x.drawImage(img, (img.width - sw) / 2, (img.height - sh) / 2, sw, sh, 0, 0, w, h);
+    return x.getImageData(0, 0, w, h).data;
+  }
+  const d2 = (d, i, c) => (d[i * 4] - c[0]) ** 2 + (d[i * 4 + 1] - c[1]) ** 2 + (d[i * 4 + 2] - c[2]) ** 2;
+  // Up to 16 colours by k-means (farthest-point start), close colours merged.
+  function palettize(d, n) {
+    const step = Math.max(1, Math.floor(n / 4000)), C = [[d[0], d[1], d[2]]];
+    while (C.length < 16) {
+      let far = -1, fd = 0;
+      for (let i = 0; i < n; i += step) { const m = Math.min(...C.map((c) => d2(d, i, c))); if (m > fd) { fd = m; far = i; } }
+      if (fd < 64) break;
+      C.push([d[far * 4], d[far * 4 + 1], d[far * 4 + 2]]);
+    }
+    const idx = new Uint8Array(n);
+    for (let it = 0; it < 8; it++) {
+      const sum = C.map(() => [0, 0, 0, 0]);
+      for (let i = 0; i < n; i++) {
+        let b = 0, bd = Infinity;
+        for (let k = 0; k < C.length; k++) { const e = d2(d, i, C[k]); if (e < bd) { bd = e; b = k; } }
+        idx[i] = b; const s = sum[b]; s[0] += d[i * 4]; s[1] += d[i * 4 + 1]; s[2] += d[i * 4 + 2]; s[3]++;
+      }
+      sum.forEach((s, k) => { if (s[3]) C[k] = [s[0] / s[3], s[1] / s[3], s[2] / s[3]].map(Math.round); });
+    }
+    // Merge near-duplicates and drop unused colours.
+    const map = C.map((_, k) => k), used = new Uint32Array(C.length);
+    for (let a = 0; a < C.length; a++) for (let b = 0; b < a; b++) if (map[b] === b && (C[a][0] - C[b][0]) ** 2 + (C[a][1] - C[b][1]) ** 2 + (C[a][2] - C[b][2]) ** 2 < 300) { map[a] = b; break; }
+    for (let i = 0; i < n; i++) { idx[i] = map[idx[i]]; used[idx[i]]++; }
+    const keep = C.map((_, k) => k).filter((k) => used[k]), re = new Map(keep.map((k, j) => [k, j]));
+    for (let i = 0; i < n; i++) idx[i] = re.get(idx[i]);
+    const pal = keep.map((k) => C[k]);
+    let mse = 0; for (let i = 0; i < n; i++) mse += d2(d, i, pal[idx[i]]) / 3;
+    return { pal, idx, mse: mse / n };
+  }
+  // Prediction: the pixel above; after a change, the pixel to the left.
+  const predict = (idx, i, w, lit) => { const x = i % w; if (i < w) return x ? idx[i - 1] : 0; return lit && x ? idx[i - 1] : idx[i - w]; };
+  function putFlat(pal, idx, w, h) {
+    const out = new Bits(), K = pal.length, lb = K > 2 ? Math.ceil(Math.log2(K - 1)) : 0;
+    out.put(K - 1, 4); for (const c of pal) for (const v of c) out.put(v, 8);
+    let run = 0, lit = false;
+    for (let i = 0; i < w * h; i++) {
+      const p = predict(idx, i, w, lit);
+      if (idx[i] === p) { run++; lit = false; continue; }
+      out.ue(run); run = 0; out.put(idx[i] < p ? idx[i] : idx[i] - 1, lb); lit = true;
+    }
+    out.ue(run);
+    return out.done();
+  }
+  function encodeFlat(img, bits) {
+    const aspect = clamp(img.width / img.height, 0.4, 2.5), bytes = Math.floor(bits / 8), dims = (w) => [w, clamp(Math.round(w / aspect), 8, 255)];
+    let lo = 16, hi = Math.min(255, Math.round(255 * aspect)), best = null;
+    while (lo <= hi) {
+      const w = (lo + hi) >> 1, [W, H] = dims(w), P = palettize(pixelsAt(img, W, H), W * H), b = putFlat(P.pal, P.idx, W, H);
+      if (b.length <= bytes) { best = { w: W, h: H, q: P.pal.length, bytes: b, codec: 2 }; lo = w + 1; } else hi = w - 1;
+    }
+    if (!best) throw new Error('image does not fit');
+    return best;
+  }
+  function decodeFlat({ w, h, bytes }) {
+    const inb = new Bits(Array.from(bytes)), K = inb.get(4) + 1, pal = Array.from({ length: K }, () => [inb.get(8), inb.get(8), inb.get(8)]);
+    const n = w * h, idx = new Uint8Array(n), lb = K > 2 ? Math.ceil(Math.log2(K - 1)) : 0;
+    let i = 0, lit = false;
+    while (i < n) {
+      let run = inb.rue();
+      if (run > n) throw new Error('bad run');
+      for (; run > 0 && i < n; run--, i++) { idx[i] = predict(idx, i, w, lit); lit = false; }
+      if (i >= n) break;
+      const p = predict(idx, i, w, lit), v = inb.get(lb);
+      idx[i] = v < p ? v : v + 1;
+      if (idx[i] >= K) throw new Error('bad colour');
+      lit = true; i++;
+    }
+    const img = new ImageData(w, h);
+    for (let k = 0; k < n; k++) { const c = pal[idx[k]]; img.data[k * 4] = c[0]; img.data[k * 4 + 1] = c[1]; img.data[k * 4 + 2] = c[2]; img.data[k * 4 + 3] = 255; }
+    return img;
+  }
+  // Flat colours when the picture is mostly flat colour (few colours cover it well), otherwise the JPEG codec.
+  function encodeImage(img, bits) {
+    const aspect = clamp(img.width / img.height, 0.4, 2.5), W = 96, H = clamp(Math.round(W / aspect), 8, 255);
+    return palettize(pixelsAt(img, W, H), W * H).mse < FLAT_MSE ? encodeFlat(img, bits) : encodeDCT(img, bits);
+  }
+  const decodeImage = (im) => (im.codec === 2 ? decodeFlat(im) : decodeDCT(im));
+
   // ---------- code ----------
   function header(img) {
     const b = new Bits();
-    b.put(MAGIC, 8); b.put(VERSION, 8); b.put(CODEC, 8); b.put(img.w, 8); b.put(img.h, 8); b.put(img.q, 8); b.put(img.bytes.length, 16); b.put(crc32(img.bytes), 32);
+    b.put(MAGIC, 8); b.put(VERSION, 8); b.put(img.codec, 8); b.put(img.w, 8); b.put(img.h, 8); b.put(img.q, 8); b.put(img.bytes.length, 16); b.put(crc32(img.bytes), 32);
     const out = new Uint8Array(HEADER); out.set(b.done()); return out;
   }
   const capacityBytes = (L) => Math.floor(L.length / 4);
@@ -274,12 +367,12 @@
     let off = 0; for (const p of parts) { data.set(p, off); off += p.length; }
     const hb = new Bits(Array.from(data.subarray(0, HEADER)));
     const magic = hb.get(8), ver = hb.get(8), codec = hb.get(8), w = hb.get(8), h = hb.get(8), q = hb.get(8), len = hb.get(16), crc = hb.get(32) >>> 0;
-    if (magic !== MAGIC || ver !== VERSION || codec !== CODEC) return { ok: false, why: 'no image code here' };
+    if (magic !== MAGIC || ver !== VERSION || (codec !== 1 && codec !== 2)) return { ok: false, why: 'no image code here' };
     const bytes = data.slice(HEADER, HEADER + len);
     if (bytes.length !== len || crc32(bytes) !== crc) return { ok: false, why: 'checksum failed', w, h };
     let image;
-    try { image = decodeImage({ w, h, q, bytes }); } catch { return { ok: false, why: 'image stream damaged' }; }
-    return { ok: true, image, w, h, q, bytes: len, blocks: bl.length };
+    try { image = decodeImage({ codec, w, h, q, bytes }); } catch { return { ok: false, why: 'image stream damaged' }; }
+    return { ok: true, image, w, h, q, codec, bytes: len, blocks: bl.length };
   }
 
   window.IMAGECODE = { lattice, encode, draw, decode, decodeSyms, decodeImage, readSyms, classify, capacityBytes, SYMS };

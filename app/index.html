@@ -51,7 +51,8 @@
   <script src="imagecode.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const canvas = $('code'), KEY = 'glyphics.registry.v1', PITCH = 10;
+    // Image codes use the densest lattice: most are shared as files, where more beads mean a sharper picture.
+    const canvas = $('code'), KEY = 'glyphics.registry.v1', PITCH = 7;
     let tab = location.hash === '#image' ? 'image' : 'link', link = null, picture = null, variant = 0, remote = {};
 
     const readLocal = () => { try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; } };

@@ -121,7 +121,7 @@
         const px = gx.getImageData(0, 0, W, H).data;
         frameNo++;
         // Image codes are heavier to try; attempt them on every third frame.
-        const r = sess.frame(px, W, H, { tryImage: frameNo % 3 === 0, pitches: [10, 9, 11, 8, 12] });
+        const r = sess.frame(px, W, H, { tryImage: frameNo % 3 === 0, pitches: [7, 8, 10, 9] });
         drawOverlay(r.E, W, H, !!r.kind);
         if (r.kind) show(r);
       }
