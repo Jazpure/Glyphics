@@ -96,7 +96,7 @@
           const img = new Image(); img.src = e.image; img.alt = e.name || 'Shared image'; target.append(img);
         } else target.textContent = 'Not available';
       }
-      actions.append(button('Scan again', () => { done = false; sess.reset(); $('result').classList.remove('on'); if (running) video.play(); drawOverlay(null); }, true));
+      actions.append(button('Scan again', () => { done = false; sess.reset(); $('result').classList.remove('on'); drawOverlay(null); if (running) video.play(); else start(); }, true));
       $('result').classList.add('on');
       say('');
     }
@@ -120,10 +120,10 @@
         gx.drawImage(video, 0, 0, W, H);
         const px = gx.getImageData(0, 0, W, H).data;
         frameNo++;
-        // Image codes are heavier to try; attempt them on every third frame.
-        const r = sess.frame(px, W, H, { tryImage: frameNo % 3 === 0, pitches: [7, 8, 10, 9] });
+        // Image codes are heavier to read: try once the code has been held still for a few frames.
+        const r = sess.frame(px, W, H, { tryImage: frameNo % 2 === 0, pitches: [7, 10], steady: 3 });
         drawOverlay(r.E, W, H, !!r.kind);
-        if (r.kind) show(r);
+        if (r.kind) show(r); else say(r.found ? 'Reading…' : '');
       }
       setTimeout(() => requestAnimationFrame(tick), 60);
     }
@@ -143,44 +143,57 @@
     }
     $('go').addEventListener('click', start);
 
-    // A photo or screenshot: try every mirror and pitch.
+    // Release the live camera, so the phone's own camera can open for the photo.
+    function stopCamera() {
+      running = false;
+      const st = video.srcObject; if (st) st.getTracks().forEach((t) => t.stop());
+      video.srcObject = null; drawOverlay(null); $('start').style.display = 'grid';
+    }
+    $('photo').closest('label').addEventListener('click', stopCamera);
+
+    // A photo or screenshot, at up to 3000 px so small beads keep their detail.
     $('photo').addEventListener('change', (e) => {
       const f = e.target.files[0]; if (!f) return;
+      e.target.value = ''; // the same photo can be chosen again
+      done = false; $('result').classList.remove('on'); say('Reading…');
       const url = URL.createObjectURL(f), img = new Image();
-      img.onload = () => {
-        const s = Math.min(1, 1600 / Math.max(img.width, img.height)), W = Math.round(img.width * s), H = Math.round(img.height * s);
-        const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, W, H);
-        const px = x.getImageData(0, 0, W, H).data, one = SCAN.session();
-        let r = null;
-        for (let k = 0; k < 3 && !(r && r.kind); k++) r = one.frame(px, W, H, { tryImage: k === 0, pitches: SCAN.PITCHES_ALL });
+      img.onerror = () => { URL.revokeObjectURL(url); say('Couldn’t open photo'); };
+      img.onload = () => setTimeout(() => {
+        try {
+          const s = Math.min(1, 3000 / Math.max(img.width, img.height)), W = Math.round(img.width * s), H = Math.round(img.height * s);
+          const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, W, H);
+          const px = x.getImageData(0, 0, W, H).data, one = SCAN.session();
+          let r = null;
+          for (let k = 0; k < 3 && !(r && r.kind); k++) r = one.frame(px, W, H, { tryImage: k === 0, pitches: [7, 10, 8, 9], mirrors: [false, true], steady: 0 });
+          if (r && r.kind) show(r); else say(r && r.found ? 'Couldn’t read' : 'No code found');
+        } catch { say('Couldn’t read'); }
         URL.revokeObjectURL(url);
-        if (r && r.kind) show(r); else say(r && r.found ? 'Couldn’t read' : 'No code found');
-      };
+      }, 30); // let "Reading…" appear first
       img.src = url;
     });
 
     // Test mode (?test): a simulated camera showing a code that drifts, turns and tilts.
     async function testStream() {
       const q = new URLSearchParams(location.search), id = Number(q.get('id') || 271828);
-      const code = document.createElement('canvas'); code.width = 1200; code.height = 900;
-      const cx = code.getContext('2d');
+      const code = document.createElement('canvas'); code.width = 2400; code.height = 1800;
+      const cx = code.getContext('2d'); cx.setTransform(2, 0, 0, 2, 0, 0);
       if (q.get('test') === 'image') {
         const pic = document.createElement('canvas'); pic.width = 320; pic.height = 240; const p = pic.getContext('2d');
         const g = p.createLinearGradient(0, 0, 0, 240); g.addColorStop(0, '#2f6fd8'); g.addColorStop(1, '#e8743b'); p.fillStyle = g; p.fillRect(0, 0, 320, 240);
         p.fillStyle = '#fff3c4'; p.beginPath(); p.arc(220, 80, 36, 0, 7); p.fill(); p.fillStyle = '#2d5a27'; p.fillRect(0, 180, 320, 60);
-        IMAGECODE.draw(cx, IMAGECODE.encode(pic, 10), 3);
+        IMAGECODE.draw(cx, IMAGECODE.encode(pic, 7), 3);
       } else {
         await new Promise((res) => { const s = document.createElement('script'); s.src = '../app/glyph.js'; s.onload = res; document.head.append(s); });
         const c = GLYPH.fromUrl(GLYPH.normaliseUrl('jasper-curtis.com'));
         GLYPH.draw(cx, { id, seed: c.seed, params: c.params });
       }
-      const cam = document.createElement('canvas'); cam.width = 1280; cam.height = 720; const k = cam.getContext('2d');
+      const cam = document.createElement('canvas'); cam.width = 1920; cam.height = 1080; const k = cam.getContext('2d');
       const t0 = performance.now();
       (function paint() {
         const t = (performance.now() - t0) / 1000;
-        k.fillStyle = '#d8d4cc'; k.fillRect(0, 0, 1280, 720);
-        k.save(); k.translate(640 + Math.sin(t * 0.4) * 60, 360 + Math.cos(t * 0.3) * 30); k.rotate(0.5 + Math.sin(t * 0.2) * 0.6); k.scale(0.62, 0.62 * (0.85 + 0.1 * Math.sin(t * 0.5)));
-        k.filter = 'blur(1.2px) saturate(0.85) brightness(0.95)'; k.drawImage(code, -600, -450); k.restore();
+        k.fillStyle = '#d8d4cc'; k.fillRect(0, 0, 1920, 1080);
+        k.save(); k.translate(960 + Math.sin(t * 0.4) * 20, 540 + Math.cos(t * 0.3) * 12); k.rotate(Math.sin(t * 0.2) * 0.3); k.scale(0.68, 0.68 * (0.92 + 0.05 * Math.sin(t * 0.5)));
+        k.filter = 'blur(1.1px) saturate(0.9) brightness(0.95)'; k.drawImage(code, -1200, -900); k.restore();
         requestAnimationFrame(paint);
       })();
       return cam.captureStream(30);
