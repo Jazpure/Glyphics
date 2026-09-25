@@ -8,8 +8,13 @@
     * { box-sizing: border-box; }
     html, body { height: 100%; }
     body { margin: 0; background: #000; color: #fff; font: 16px/1.45 system-ui, -apple-system, sans-serif; overflow: hidden; }
-    video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 0.2s; }
-    video.live { opacity: 1; }
+    /* The camera is shown on a canvas laid over the video element, so nothing
+       the browser draws on a video (play or pause icons) is ever visible. The
+       video stays full size underneath: iOS pauses videos it thinks are off screen. */
+    video, #view { position: fixed; inset: 0; width: 100%; height: 100%; }
+    video { object-fit: cover; }
+    #view { z-index: 1; background: #000; opacity: 0; transition: opacity 0.2s; }
+    #view.live { opacity: 1; }
     /* No play or pause icons over the live view. */
     video::-webkit-media-controls, video::-webkit-media-controls-start-playback-button, video::-webkit-media-controls-overlay-play-button, video::-webkit-media-controls-panel { display: none !important; -webkit-appearance: none; }
     .logo { position: fixed; top: calc(14px + env(safe-area-inset-top)); left: 16px; z-index: 6; color: #fff; text-decoration: none; font-weight: 700; font-size: 18px; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.6); }
@@ -28,15 +33,16 @@
 </head>
 <body>
   <video id="video" playsinline muted autoplay disablepictureinpicture></video>
+  <canvas id="view"></canvas>
   <a class="logo" href="../">Glyphics</a>
   <div id="start" hidden><button id="go">Start camera</button></div>
   <div id="pop" hidden><div class="card"><div id="content"></div><button id="close" aria-label="Close">×</button></div></div>
   <pre id="debug" hidden></pre>
 
-  <script src="../sketches/lib.js?v=20260925i"></script>
-  <script src="../app/rs.js?v=20260925i"></script>
-  <script src="../app/tilecode.js?v=20260925i"></script>
-  <script src="scan.js?v=20260925i"></script>
+  <script src="../sketches/lib.js?v=20260925j"></script>
+  <script src="../app/rs.js?v=20260925j"></script>
+  <script src="../app/tilecode.js?v=20260925j"></script>
+  <script src="scan.js?v=20260925j"></script>
   <script>
     const $ = (id) => document.getElementById(id), video = $('video'), q = new URLSearchParams(location.search);
     const grab = document.createElement('canvas'), gx = grab.getContext('2d', { willReadFrequently: true }), DEBUG = q.has('debug');
@@ -89,8 +95,19 @@
     $('close').addEventListener('click', () => { $('pop').hidden = true; open = false; reader.reset(); last.until = performance.now() + 2500; });
 
     // Frames go to the reader at up to 2048 px on the long side, whenever it is free.
+    // Draw the current camera frame over the whole screen, cropped to fill it.
+    const view = $('view'), vx = view.getContext('2d');
+    function paintView() {
+      if (video.readyState < 2 || !video.videoWidth) return;
+      const dpr = Math.min(2, devicePixelRatio || 1), w = Math.round(view.clientWidth * dpr), h = Math.round(view.clientHeight * dpr);
+      if (view.width !== w || view.height !== h) { view.width = w; view.height = h; }
+      const s = Math.max(w / video.videoWidth, h / video.videoHeight), dw = video.videoWidth * s, dh = video.videoHeight * s;
+      vx.drawImage(video, (w - dw) / 2, (h - dh) / 2, dw, dh);
+      view.classList.add('live');
+    }
     function tick() {
       if (!running) return;
+      paintView();
       if (!busy && !open && video.readyState >= 2 && video.videoWidth) {
         const k = Math.min(1, 2048 / Math.max(video.videoWidth, video.videoHeight)), W = Math.round(video.videoWidth * k), H = Math.round(video.videoHeight * k);
         if (grab.width !== W || grab.height !== H) { grab.width = W; grab.height = H; }
@@ -115,7 +132,7 @@
       try {
         const stream = q.has('test') ? await testStream() : await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } }, audio: false });
         video.srcObject = stream; await video.play();
-        video.classList.add('live'); running = true; tick();
+        running = true; tick();
       } catch { $('start').hidden = false; }
     }
     $('go').addEventListener('click', start);
