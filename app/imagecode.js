@@ -227,6 +227,15 @@
     const { idx } = assign(d, n, pal), cnt = pal.map(() => 0);
     for (let i = 0; i < n; i++) cnt[idx[i]]++;
     let P = pal.map((c, k) => ({ c: c.slice(), n: cnt[k] })).filter((p) => p.n);
+    // Does x sit between y and some third colour (an edge blend of the two)?
+    const between = (x, y) => P.some((z) => {
+      if (z === x || z === y) return false;
+      const ab = [0, 1, 2].map((k) => z.c[k] - y.c[k]), L = ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2;
+      if (L < 900) return false;
+      const t = ((x.c[0] - y.c[0]) * ab[0] + (x.c[1] - y.c[1]) * ab[1] + (x.c[2] - y.c[2]) * ab[2]) / L;
+      const off = [0, 1, 2].reduce((e, k) => e + (y.c[k] + t * ab[k] - x.c[k]) ** 2, 0);
+      return t > 0.02 && t < 0.9 && off < L * 0.03;
+    });
     while (P.length > 3) {
       let bi = -1, bj = -1, bc = Infinity;
       for (let i = 0; i < P.length; i++) for (let j = 0; j < i; j++) {
@@ -235,8 +244,9 @@
       }
       if (bc / n > limit) break;
       const a = P[bi], b = P[bj], t = a.n + b.n;
-      // Keep the larger colour's value exactly, so flat areas stay true.
-      const keep = a.n >= b.n ? a : b;
+      // Keep the drawing's own colour exactly, not the edge blend beside it (black
+      // ink, not the dark blue where ink meets a blue sky); else the commoner one.
+      const aMid = between(a, b), bMid = between(b, a), keep = aMid !== bMid ? (aMid ? b : a) : a.n >= b.n ? a : b;
       P = P.filter((p) => p !== a && p !== b).concat([{ c: keep.c, n: t }]);
     }
     return P.map((p) => p.c);
