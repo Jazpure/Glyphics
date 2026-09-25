@@ -2,22 +2,50 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Glyphics</title>
   <style>
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0a0a0a; color: #fff; font: 16px/1.45 system-ui, -apple-system, sans-serif; }
-    main { width: min(420px, 100% - 32px); display: flex; flex-direction: column; gap: 14px; }
-    h1 { margin: 0 0 10px; font-size: 32px; letter-spacing: -0.01em; }
-    a { display: block; padding: 18px; border-radius: 4px; background: #fff; color: #000; text-decoration: none; font-size: 18px; text-align: center; }
-    a.ghost { background: transparent; color: #fff; box-shadow: inset 0 0 0 1px #fff; }
+    body { margin: 0; background: #fff; color: #111; font: 17px/1.65 system-ui, -apple-system, sans-serif; }
+    .hero { position: relative; height: 100vh; height: 100svh; display: grid; place-items: center; overflow: hidden; }
+    #bg { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .gate { position: relative; display: flex; flex-direction: column; align-items: center; gap: 22px; padding: 0 16px; }
+    h1 { margin: 0; font-size: clamp(46px, 12vw, 96px); line-height: 1; font-weight: 800; letter-spacing: -0.02em; }
+    .buttons { display: flex; gap: 12px; }
+    .buttons a, .buttons button { min-width: 136px; padding: 15px 22px; border: 0; border-radius: 4px; font: 600 17px system-ui, -apple-system, sans-serif; text-align: center; text-decoration: none; cursor: pointer; }
+    #scan { background: #111; color: #fff; }
+    #make { background: #fff; color: #111; box-shadow: inset 0 0 0 1.5px #111; }
+    #msg { min-height: 1.4em; margin-top: -8px; font: 14px ui-monospace, "SF Mono", Menlo, monospace; color: #555; }
+    .down { position: absolute; left: 50%; bottom: calc(16px + env(safe-area-inset-bottom)); transform: translateX(-50%); padding: 8px 12px; color: #111; opacity: 0.45; font-size: 22px; text-decoration: none; }
+    .about { position: relative; max-width: 640px; margin: 0 auto; padding: 80px 24px 110px; }
+    .about p { margin: 0 0 1.1em; }
+    .about .placeholder { color: #aaa; }
   </style>
 </head>
 <body>
-  <main>
-    <h1>Glyphics</h1>
-    <a href="scan/">Scan</a>
-    <a class="ghost" href="app/">Make</a>
-  </main>
+  <section class="hero">
+    <canvas id="bg" aria-hidden="true"></canvas>
+    <div class="gate">
+      <h1>Glyphics</h1>
+      <div class="buttons"><button id="scan">Scan</button><a id="make" href="app/">Make</a></div>
+      <div id="msg"></div>
+    </div>
+    <a class="down" href="#about" aria-label="About">↓</a>
+  </section>
+
+  <section class="about" id="about">
+    <!-- Your writing about Glyphics goes here: why you made it and how it
+         works. Replace the paragraph below with as many <p> paragraphs as
+         you like. -->
+    <p class="placeholder">Your words about Glyphics go here.</p>
+  </section>
+
+  <script src="sketches/lib.js?v=20260925k"></script>
+  <script src="sketches/r9/tiles.js?v=20260925k"></script>
+  <script src="app/rs.js?v=20260925k"></script>
+  <script src="app/tilecode.js?v=20260925k"></script>
+  <script src="scan/scan.js?v=20260925k"></script>
+  <script src="scan/scanner.js?v=20260925k"></script>
+  <script src="home.js?v=20260925k"></script>
 </body>
 </html>

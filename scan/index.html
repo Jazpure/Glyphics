@@ -5,154 +5,30 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Glyphics — scan</title>
   <style>
-    * { box-sizing: border-box; }
     html, body { height: 100%; }
     body { margin: 0; background: #000; color: #fff; font: 16px/1.45 system-ui, -apple-system, sans-serif; overflow: hidden; }
-    /* The camera is shown on a canvas laid over the video element, so nothing
-       the browser draws on a video (play or pause icons) is ever visible. The
-       video stays full size underneath: iOS pauses videos it thinks are off screen. */
-    video, #view { position: fixed; inset: 0; width: 100%; height: 100%; }
-    video { object-fit: cover; }
-    #view { z-index: 1; background: #000; opacity: 0; transition: opacity 0.2s; }
-    #view.live { opacity: 1; }
-    /* No play or pause icons over the live view. */
-    video::-webkit-media-controls, video::-webkit-media-controls-start-playback-button, video::-webkit-media-controls-overlay-play-button, video::-webkit-media-controls-panel { display: none !important; -webkit-appearance: none; }
-    .logo { position: fixed; top: calc(14px + env(safe-area-inset-top)); left: 16px; z-index: 6; color: #fff; text-decoration: none; font-weight: 700; font-size: 18px; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.6); }
+    #start { position: fixed; inset: 0; display: grid; place-items: center; }
     button { font: 15px system-ui, sans-serif; padding: 13px 18px; border: 0; border-radius: 4px; background: #fff; color: #000; cursor: pointer; }
-    #start { position: fixed; inset: 0; display: grid; place-items: center; z-index: 2; }
-    /* What a code points to, over the camera. */
-    #pop { position: fixed; inset: 0; z-index: 4; display: grid; place-items: center; padding: calc(56px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom)); background: rgba(0, 0, 0, 0.5); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
-    .card { position: relative; max-width: min(100%, 760px); max-height: 100%; display: flex; }
-    .card img { display: block; max-width: 100%; max-height: calc(100vh - 120px); max-height: calc(100dvh - 120px); border-radius: 6px; background: #111; }
-    .card a { display: block; padding: 28px 24px; border-radius: 6px; background: #fff; color: #000; font-size: 20px; overflow-wrap: anywhere; text-align: center; }
-    .card .note { padding: 22px 28px; border-radius: 6px; background: #fff; color: #000; }
-    #close { position: absolute; top: -14px; right: -14px; width: 40px; height: 40px; padding: 0; border-radius: 50%; font-size: 24px; line-height: 40px; background: #fff; color: #000; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35); }
-    #debug { position: fixed; left: 8px; bottom: calc(8px + env(safe-area-inset-bottom)); z-index: 5; margin: 0; padding: 6px 8px; background: rgba(0, 0, 0, 0.6); color: #0f0; font: 11px ui-monospace, Menlo, monospace; white-space: pre; }
     [hidden] { display: none !important; }
   </style>
 </head>
 <body>
-  <video id="video" playsinline muted autoplay disablepictureinpicture></video>
-  <canvas id="view"></canvas>
-  <a class="logo" href="../">Glyphics</a>
-  <div id="start" hidden><button id="go">Start camera</button></div>
-  <div id="pop" hidden><div class="card"><div id="content"></div><button id="close" aria-label="Close">×</button></div></div>
-  <pre id="debug" hidden></pre>
+  <!-- Opened directly (or reloaded); from the home page the camera view opens in place. -->
+  <div id="start" hidden><button id="go">Scan</button></div>
 
-  <script src="../sketches/lib.js?v=20260925j"></script>
-  <script src="../app/rs.js?v=20260925j"></script>
-  <script src="../app/tilecode.js?v=20260925j"></script>
-  <script src="scan.js?v=20260925j"></script>
+  <script src="../sketches/lib.js?v=20260925k"></script>
+  <script src="../app/rs.js?v=20260925k"></script>
+  <script src="../app/tilecode.js?v=20260925k"></script>
+  <script src="scan.js?v=20260925k"></script>
+  <script src="scanner.js?v=20260925k"></script>
   <script>
-    const $ = (id) => document.getElementById(id), video = $('video'), q = new URLSearchParams(location.search);
-    const grab = document.createElement('canvas'), gx = grab.getContext('2d', { willReadFrequently: true }), DEBUG = q.has('debug');
-    let running = false, busy = false, open = false, last = { id: null, until: 0 };
-    $('debug').hidden = !DEBUG;
-
-    // Reading runs in a worker so the camera view stays smooth.
-    const reader = (() => {
-      const waiting = new Map(); let seq = 0, w = null;
-      try {
-        w = new Worker('worker.js' + (document.querySelector('script[src^="scan.js"]').src.match(/\?.*$/) || [''])[0]);
-        w.onmessage = ({ data }) => { const f = waiting.get(data.id); waiting.delete(data.id); if (f) f(data.r); };
-        w.onerror = () => { w = null; waiting.forEach((f) => f({ found: false })); waiting.clear(); };
-      } catch { w = null; }
-      const here = SCAN.session();
-      return {
-        read(px, W, H) {
-          if (!w) { const dbg = {}, r = here.frame(new Uint8ClampedArray(px), W, H, dbg); return Promise.resolve({ ...r, dbg }); }
-          const id = ++seq;
-          return new Promise((res) => { waiting.set(id, res); w.postMessage({ id, px, W, H }, [px]); });
-        },
-        reset() { here.reset(); if (w) w.postMessage({ reset: true }); },
-      };
-    })();
-
-    // What a code points to: the site's store, then the list kept with the site.
-    let listed = null;
-    async function lookup(id) {
-      const r = await fetch('../api/codes/' + id).catch(() => null);
-      if (r && r.ok && (r.headers.get('Content-Type') || '').includes('json')) { const e = await r.json().catch(() => null); if (e && e.type) return e; }
-      if (!listed) listed = await fetch('../codes.json').then((x) => (x.ok ? x.json() : {})).catch(() => ({}));
-      return (listed.codes || {})[id] || null;
+    const start = document.getElementById('start');
+    async function go() {
+      start.hidden = true;
+      try { SCANNER.open(await SCANNER.request()); } catch { start.hidden = false; }
     }
-    async function show(id) {
-      open = true;
-      const box = $('content'); box.replaceChildren();
-      const e = await lookup(id);
-      if (!open) return;
-      if (e && e.type === 'image' && e.src) {
-        const img = new Image(); img.alt = 'Image'; img.src = new URL(e.src, location.href).href; box.append(img);
-      } else if (e && e.type === 'url' && /^https?:\/\//.test(e.url || '')) {
-        const a = document.createElement('a'); a.href = e.url; a.textContent = e.url; a.target = '_blank'; a.rel = 'noopener'; box.append(a);
-      } else {
-        const p = document.createElement('div'); p.className = 'note'; p.textContent = 'Not found'; box.append(p);
-      }
-      $('pop').hidden = false;
-    }
-    // Closing goes back to scanning; the same code is left alone for a moment
-    // so it doesn't pop straight back up.
-    $('close').addEventListener('click', () => { $('pop').hidden = true; open = false; reader.reset(); last.until = performance.now() + 2500; });
-
-    // Frames go to the reader at up to 2048 px on the long side, whenever it is free.
-    // Draw the current camera frame over the whole screen, cropped to fill it.
-    const view = $('view'), vx = view.getContext('2d');
-    function paintView() {
-      if (video.readyState < 2 || !video.videoWidth) return;
-      const dpr = Math.min(2, devicePixelRatio || 1), w = Math.round(view.clientWidth * dpr), h = Math.round(view.clientHeight * dpr);
-      if (view.width !== w || view.height !== h) { view.width = w; view.height = h; }
-      const s = Math.max(w / video.videoWidth, h / video.videoHeight), dw = video.videoWidth * s, dh = video.videoHeight * s;
-      vx.drawImage(video, (w - dw) / 2, (h - dh) / 2, dw, dh);
-      view.classList.add('live');
-    }
-    function tick() {
-      if (!running) return;
-      paintView();
-      if (!busy && !open && video.readyState >= 2 && video.videoWidth) {
-        const k = Math.min(1, 2048 / Math.max(video.videoWidth, video.videoHeight)), W = Math.round(video.videoWidth * k), H = Math.round(video.videoHeight * k);
-        if (grab.width !== W || grab.height !== H) { grab.width = W; grab.height = H; }
-        gx.drawImage(video, 0, 0, W, H);
-        busy = true;
-        const t0 = performance.now();
-        reader.read(gx.getImageData(0, 0, W, H).data.buffer, W, H).then((r) => {
-          busy = false;
-          if (DEBUG) $('debug').textContent = `${video.videoWidth}×${video.videoHeight} → ${W}×${H}  ${Math.round(performance.now() - t0)} ms\nblobs ${r.dbg?.blobs ?? '-'}  step ${r.dbg?.step ?? '-'}  stages ${r.dbg?.stages ?? '-'}  ${r.found ? 'grid' : 'no grid'}  ${r.id || ''}${r.dbg?.error ? '\n' + r.dbg.error : ''}`;
-          if (!r.id || open || !running) return;
-          if (r.id === last.id && performance.now() < last.until) return;
-          last = { id: r.id, until: 0 };
-          show(r.id);
-        });
-      }
-      requestAnimationFrame(tick);
-    }
-
-    async function start() {
-      if (running) return;
-      $('start').hidden = true;
-      try {
-        const stream = q.has('test') ? await testStream() : await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } }, audio: false });
-        video.srcObject = stream; await video.play();
-        running = true; tick();
-      } catch { $('start').hidden = false; }
-    }
-    $('go').addEventListener('click', start);
-    start();
-
-    // Test mode (?test&id=…&dark): a simulated camera showing a code that drifts and turns.
-    async function testStream() {
-      await new Promise((res) => { const s = document.createElement('script'); s.src = '../sketches/r9/tiles.js'; s.onload = res; document.head.append(s); });
-      const code = document.createElement('canvas'), k = 2400 / TILECODE.CW; code.width = 2400; code.height = Math.round(TILECODE.CH * k);
-      const cx = code.getContext('2d'); cx.setTransform(k, 0, 0, k, 0, 0); TILECODE.draw(cx, { id: q.get('id') || '14e6429ddf1facae', seed: 5 });
-      const cam = document.createElement('canvas'); cam.width = 1080; cam.height = 1920; const g = cam.getContext('2d'), t0 = performance.now();
-      (function paint() {
-        const t = (performance.now() - t0) / 1000;
-        g.fillStyle = q.has('dark') ? '#0b0b0d' : '#d8d4cc'; g.fillRect(0, 0, 1080, 1920);
-        g.save(); g.translate(540 + Math.sin(t * 0.4) * 14, 960 + Math.cos(t * 0.3) * 10); g.rotate(Math.sin(t * 0.2) * 0.06); g.scale(0.42, 0.42);
-        g.filter = 'blur(1.4px)'; g.drawImage(code, -1200, -code.height / 2); g.restore();
-        requestAnimationFrame(paint);
-      })();
-      return cam.captureStream(30);
-    }
+    document.getElementById('go').addEventListener('click', go);
+    go();
   </script>
 </body>
 </html>
