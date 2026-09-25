@@ -45,15 +45,15 @@
       <div class="target" id="rTarget"></div>
       <div class="row" id="rActions"></div>
     </div>
-    <label class="file">Scan photo<input id="photo" type="file" accept="image/*"></label>
+    <label class="file">Upload image<input id="photo" type="file" accept="image/*"></label>
   </div>
 
-  <script src="../sketches/lib.js?v=20260925c"></script>
-  <script src="../sketches/kit.js?v=20260925c"></script>
-  <script src="../sketches/r8/code.js?v=20260925c"></script>
-  <script src="../app/rs.js?v=20260925c"></script>
-  <script src="../app/imagecode.js?v=20260925c"></script>
-  <script src="scan.js?v=20260925c"></script>
+  <script src="../sketches/lib.js?v=20260925d"></script>
+  <script src="../sketches/kit.js?v=20260925d"></script>
+  <script src="../sketches/r8/code.js?v=20260925d"></script>
+  <script src="../app/rs.js?v=20260925d"></script>
+  <script src="../app/imagecode.js?v=20260925d"></script>
+  <script src="scan.js?v=20260925d"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const video = $('video'), overlay = $('overlay'), grab = document.createElement('canvas'), gx = grab.getContext('2d', { willReadFrequently: true });
@@ -74,11 +74,8 @@
       const meta = $('rMeta'), target = $('rTarget'), actions = $('rActions');
       target.replaceChildren(); actions.replaceChildren();
       if (hit.kind === 'image') {
-        // The carried image is small; show and save it smoothly enlarged.
-        const t = document.createElement('canvas'); t.width = hit.image.w; t.height = hit.image.h; t.getContext('2d').putImageData(hit.image.image, 0, 0);
-        const k = Math.max(1, Math.round(800 / Math.max(hit.image.w, hit.image.h))), big = document.createElement('canvas');
-        big.width = hit.image.w * k; big.height = hit.image.h * k;
-        const bx = big.getContext('2d'); bx.imageSmoothingQuality = 'high'; bx.drawImage(t, 0, 0, big.width, big.height);
+        // The carried image is small; enlarge it for showing and saving.
+        const big = enlarge(hit.image.image, 1600);
         const img = new Image(); img.src = big.toDataURL('image/png'); img.alt = 'Image carried by the code';
         target.append(img);
         const a = document.createElement('a'); a.download = 'glyphics-image.png'; a.href = img.src;
@@ -98,7 +95,62 @@
       }
       actions.append(button('Scan again', () => { done = false; sess.reset(); $('result').classList.remove('on'); drawOverlay(null); if (running) video.play(); else start(); }, true));
       $('result').classList.add('on');
+      $('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       say('');
+    }
+
+    // A drawing's real colours, and for each shade the real colours it blends.
+    function drawingColours(im) {
+      const cols = new Map(), n = im.width * im.height;
+      for (let i = 0; i < im.data.length; i += 4) {
+        const key = (im.data[i] << 16) | (im.data[i + 1] << 8) | im.data[i + 2];
+        if (!cols.has(key)) { if (cols.size >= 16) return null; cols.set(key, 0); }
+        cols.set(key, cols.get(key) + 1);
+      }
+      const keys = [...cols.keys()], pal = keys.map((k) => [k >> 16, (k >> 8) & 255, k & 255]), of = IMAGECODE.blendsOf(pal, keys.map((k) => cols.get(k) / n));
+      const real = pal.map((_, k) => k).filter((k) => !of[k]);
+      const ends = (k, d = 0) => (!of[k] ? [k] : d > 4 ? [] : [...ends(of[k][0], d + 1), ...ends(of[k][1], d + 1)]);
+      return {
+        real: real.map((k) => pal[k]), share: real.map((k) => cols.get(keys[k]) / n),
+        maskOf: new Map(keys.map((key, k) => [key, ends(k).reduce((m, r) => m | (1 << real.indexOf(r)), 0)])),
+      };
+    }
+    // Enlarge a decoded picture. Drawings: smooth, then snap every pixel to a real
+    // colour found near it, so lines and lettering come out clean at any size.
+    function enlarge(im, target) {
+      const t = document.createElement('canvas'); t.width = im.width; t.height = im.height; t.getContext('2d').putImageData(im, 0, 0);
+      const k = Math.max(1, target / Math.max(im.width, im.height)), out = document.createElement('canvas');
+      out.width = Math.round(im.width * k); out.height = Math.round(im.height * k);
+      const ox = out.getContext('2d'); ox.imageSmoothingEnabled = true; ox.imageSmoothingQuality = 'high';
+      const dc = drawingColours(im);
+      if (!dc || dc.real.length < 2) { ox.drawImage(t, 0, 0, out.width, out.height); return out; }
+      const w = im.width, h = im.height, near = new Uint16Array(w * h);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let m = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const X = Math.min(w - 1, Math.max(0, x + dx)), Y = Math.min(h - 1, Math.max(0, y + dy)), i = (Y * w + X) * 4;
+          m |= dc.maskOf.get((im.data[i] << 16) | (im.data[i + 1] << 8) | im.data[i + 2]);
+        }
+        near[y * w + x] = m;
+      }
+      // Work at twice the size, then halve: the snapped edges come out anti-aliased.
+      const big = document.createElement('canvas'), BW = (big.width = out.width * 2), BH = (big.height = out.height * 2), s = w / BW;
+      const bx = big.getContext('2d', { willReadFrequently: true }); bx.imageSmoothingEnabled = true; bx.imageSmoothingQuality = 'high';
+      bx.filter = `blur(${(k * 0.8).toFixed(2)}px)`; bx.drawImage(t, 0, 0, BW, BH); bx.filter = 'none';
+      // Rare colours (ink) win more of each edge, so thin lines stay unbroken.
+      const d = bx.getImageData(0, 0, BW, BH), P = dc.real, wt = dc.share.map((f) => Math.max(f, 0.002) ** 0.25);
+      for (let y = 0, i = 0; y < BH; y++) {
+        const row = Math.min(h - 1, (y * s) | 0) * w;
+        for (let x = 0; x < BW; x++, i += 4) {
+          const m = near[row + Math.min(w - 1, (x * s) | 0)];
+          let best = 0, bd = Infinity;
+          for (let c = 0; c < P.length; c++) if (m & (1 << c)) { const e = wt[c] * ((d.data[i] - P[c][0]) ** 2 + (d.data[i + 1] - P[c][1]) ** 2 + (d.data[i + 2] - P[c][2]) ** 2); if (e < bd) { bd = e; best = c; } }
+          d.data[i] = P[best][0]; d.data[i + 1] = P[best][1]; d.data[i + 2] = P[best][2];
+        }
+      }
+      bx.putImageData(d, 0, 0);
+      ox.drawImage(big, 0, 0, out.width, out.height);
+      return out;
     }
 
     // Outline of what the scanner sees, on top of the video (object-fit: cover).
@@ -138,10 +190,13 @@
         running = true; tick();
       } catch (err) {
         $('start').style.display = 'grid';
-        say('Camera unavailable');
+        if (err && err.name !== 'NotAllowedError') say('Camera unavailable');
       }
     }
     $('go').addEventListener('click', start);
+    // Open straight into scanning, like a scanner; the button is only a fallback
+    // for browsers that want a tap before the camera starts.
+    start();
 
     // Release the live camera, so the phone's own camera can open for the photo.
     function stopCamera() {
