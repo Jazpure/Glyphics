@@ -1,0 +1,3 @@
+# Always revalidate, so a new deploy reaches phones straight away.
+/*
+  Cache-Control: public, max-age=0, must-revalidate
