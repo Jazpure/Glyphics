@@ -56,7 +56,7 @@
     },
     {
       name: 'Free Scale', from: 'r9 · 1 + 3 + 13',
-      rule: 'No grid: icons of every size packed into the rectangle, largest first, small ones filling the gaps with a little air around each. Now and then a small icon sits across the edge of a big one.',
+      rule: 'No grid: icons of every size packed into the rectangle, largest first, small ones filling the gaps with a little air around each. Now and then a small icon sits across the edge of a big one. A faint grid of small light blue dots lies over everything.',
       draw(ctx, r, nz, env) {
         const P = palette(env), F = frame(16, 9), X0 = F.x0, Y0 = F.y0, W = F.cols * F.s, H = F.rows * F.s, V = vocabulary(r, KINDS, 30), placed = [];
         ctx.fillStyle = P.ground; ctx.fillRect(0, 0, GL.W, GL.H);
@@ -81,6 +81,11 @@
         // Larger first, so the small ones read on top where they overlap.
         placed.sort((a, b) => b.half - a.half);
         for (const p of placed) drawIcon(ctx, p.m, p.x, p.y, p.half, p.c, P.ground);
+        // A faint dot grid over the whole rectangle, edges included, like graph paper.
+        const step = F.s / 2, n = Math.round(W / step), m = Math.round(H / step);
+        ctx.fillStyle = 'rgba(120, 175, 255, 0.5)'; ctx.beginPath();
+        for (let i = 0; i <= n; i++) for (let j = 0; j <= m; j++) { const x = X0 + (i * W) / n, y = Y0 + (j * H) / m; ctx.moveTo(x + 1.3, y); ctx.arc(x, y, 1.3, 0, TAU); }
+        ctx.fill();
       },
     },
   ];
