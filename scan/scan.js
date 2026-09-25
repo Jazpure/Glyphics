@@ -253,8 +253,8 @@
   // Pull the starting guess onto the beads actually seen: match lattice beads to
   // nearby blobs and refit, growing outward from the centre band by band (each
   // fit predicts the next band well), then solve for lens distortion.
-  function register(blobs, grid, cell, L, H0, spacing, frameW, frameH) {
-    const M = { H: H0, k: 0, cx: frameW / 2, cy: frameH / 2, r0: Math.hypot(frameW, frameH) / 2 };
+  function register(blobs, grid, cell, L, H0, spacing, frameW, frameH, k0 = null) {
+    const M = { H: H0, k: k0 ?? 0, cx: frameW / 2, cy: frameH / 2, r0: Math.hypot(frameW, frameH) / 2 };
     const qOf = (b) => Math.hypot((b.x - O.cx) / O.rx, (b.y - O.cy) / O.ry);
     const Lq = L.map((b) => [b, qOf(b)]);
     const match = (qmax, rad) => {
@@ -275,6 +275,13 @@
       if (Hn) M.H = Hn;
       return !!Hn;
     };
+    // Following on from the last frame (k0 given): the start is already close.
+    if (k0 !== null) {
+      let pairs = [];
+      // Outward from the centre, which moves least when the phone turns a little.
+      for (const [q, rad] of [[0.5, 0.45], [0.75, 0.45], [1, 0.45], [1, 0.4], [1, 0.35]]) { pairs = match(q, rad); if (pairs.length < 30 || !refit(pairs, false)) return null; }
+      return { M, matched: pairs.length / Lq.length };
+    }
     // The outline gives rotation and scale only roughly under tilt: try small
     // turns and scalings about the centre and keep the start that matches the
     // most inner beads tightly.
@@ -312,23 +319,42 @@
     const total = Lq.length;
     return { M, matched: pairs.length / total };
   }
-  // Colour of each bead: the brightest pixels near its centre (a blurred bead
-  // is brightest in the middle and muddied at its edge). Classes are learned
-  // from this frame's own colours, compared by chroma so dim beads still sort.
-  function beadColours(frame, W, H, L, M, spacing) {
-    const r = Math.max(1, Math.round(spacing * 0.2));
-    const rgb = L.map((b) => {
-      const [x, y] = project(M, b.x, b.y), px = [];
-      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) { if (dx * dx + dy * dy > r * r) continue; const p = pixel(frame, W, H, x + dx, y + dy); if (p) px.push(p); }
-      if (!px.length) return [0, 0, 0];
-      px.sort((a, b) => Math.max(...b) - Math.max(...a));
-      const top = px.slice(0, Math.max(1, Math.ceil(px.length * 0.25)));
-      return [0, 1, 2].map((j) => top.reduce((a, p) => a + p[j], 0) / top.length);
+  // Bilinear sample of the frame at (x, y), added into acc with weight w.
+  function addSample(frame, W, H, x, y, w, acc) {
+    if (x < 0 || y < 0 || x >= W - 1 || y >= H - 1) return 0;
+    const X = x | 0, Y = y | 0, fx = x - X, fy = y - Y, o = (Y * W + X) * 4, o2 = o + W * 4;
+    for (let k = 0; k < 3; k++) {
+      const a = frame[o + k] + (frame[o + 4 + k] - frame[o + k]) * fx, b = frame[o2 + k] + (frame[o2 + 4 + k] - frame[o2 + k]) * fx;
+      acc[k] += w * (a + (b - a) * fy);
+    }
+    return w;
+  }
+  // Raw colour of each bead: a centre-weighted average over its middle, where a
+  // blurred bead keeps the most of its own colour.
+  function beadRGB(frame, W, H, L, M, unit) {
+    const out = new Float32Array(L.length * 3), acc = [0, 0, 0];
+    L.forEach((b, i) => {
+      const [x, y] = project(M, b.x, b.y), rad = Math.max(0.6, 0.22 * b.s * unit), st = Math.max(0.5, rad / 2), s2 = 2 * (rad * 0.7) ** 2;
+      acc[0] = acc[1] = acc[2] = 0; let wsum = 0;
+      for (let dy = -rad; dy <= rad + 1e-6; dy += st) for (let dx = -rad; dx <= rad + 1e-6; dx += st) {
+        const d2 = dx * dx + dy * dy; if (d2 > rad * rad) continue;
+        wsum += addSample(frame, W, H, x + dx, y + dy, Math.exp(-d2 / s2), acc);
+      }
+      if (wsum) for (let k = 0; k < 3; k++) out[i * 3 + k] = acc[k] / wsum;
     });
-    const feat = (c) => { const m = Math.max(...c, 1); return [c[0] / m, c[1] / m, c[2] / m, (m / 255) * 0.5]; };
-    const first = rgb.map((c) => hueClass(c[0], c[1], c[2], true));
-    const mean = [0, 1, 2, 3].map((k) => { const fs = rgb.filter((_, i) => first[i] === k).map(feat); return fs.length ? [0, 1, 2, 3].map((j) => fs.reduce((a, f) => a + f[j], 0) / fs.length) : null; });
-    return rgb.map((c, i) => {
+    return out;
+  }
+  // Sort colours into the four bead classes. Classes are learned from this
+  // frame's own colours and compared by chroma, so dim beads still sort.
+  function classify(rgb, n) {
+    const col = (i) => [rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]];
+    const feat = (c) => { const m = Math.max(c[0], c[1], c[2], 1); return [c[0] / m, c[1] / m, c[2] / m, (m / 255) * 0.5]; };
+    const first = Array.from({ length: n }, (_, i) => { const c = col(i); return hueClass(c[0], c[1], c[2], true); });
+    const sum = [0, 1, 2, 3].map(() => [0, 0, 0, 0, 0]);
+    for (let i = 0; i < n; i++) if (first[i] >= 0) { const f = feat(col(i)), s = sum[first[i]]; for (let j = 0; j < 4; j++) s[j] += f[j]; s[4]++; }
+    const mean = sum.map((s) => (s[4] ? s.slice(0, 4).map((v) => v / s[4]) : null));
+    return Array.from({ length: n }, (_, i) => {
+      const c = col(i);
       if (Math.max(...c) < 50) return first[i] >= 0 ? first[i] : 0;
       const f = feat(c);
       let best = first[i] >= 0 ? first[i] : 0, bd = Infinity;
@@ -336,15 +362,32 @@
       return best;
     });
   }
-  function imageRead(frame, W, H, E, { pitches = [7], mirrors = [false] } = {}) {
+  function beadColours(frame, W, H, L, M, unit) { return classify(beadRGB(frame, W, H, L, M, unit), L.length); }
+  function gridOf(blobs, cell) {
+    const grid = new Map();
+    blobs.forEach((b, k) => { const key = Math.floor(b[0] / cell) * 65536 + Math.floor(b[1] / cell); if (!grid.has(key)) grid.set(key, []); grid.get(key).push(k); });
+    return grid;
+  }
+  // Follow a registration from the previous frame: shift it by how far the
+  // outline moved, then refine. Much cheaper than searching from scratch.
+  function track(frame, W, H, E, last) {
     const blobs = beadBlobs(frame, W, H, E);
     if (blobs.length < 60) return null;
+    const spacing = last.p * (E.a / O.rx), cell = Math.max(4, spacing), dx = E.cx - last.E.cx, dy = E.cy - last.E.cy, h = last.M.H;
+    const H0 = [h[0] + dx * h[6], h[1] + dx * h[7], h[2] + dx * h[8], h[3] + dy * h[6], h[4] + dy * h[7], h[5] + dy * h[8], h[6], h[7], h[8]];
+    const reg = register(blobs, gridOf(blobs, cell), cell, last.L, H0, spacing, W, H, last.M.k);
+    // Only trust it if it fits about as well as the full search did.
+    return reg && reg.matched >= last.ref * 0.85 ? { ...last, spacing, ...reg } : null;
+  }
+  // Where the lattice sits in this frame, for each pitch and mirror that fit; best first.
+  function registerAll(frame, W, H, E, pitches, mirrors) {
+    const blobs = beadBlobs(frame, W, H, E);
+    if (blobs.length < 60) return [];
     const scale = E.a / O.rx;
     // Which lattice (pitch) fits the blobs best? Decode only the best few.
     const tried = [];
     for (const p of pitches) {
-      const L = (LAT[p] ||= IC.lattice(p)), spacing = p * scale, cell = Math.max(4, spacing), grid = new Map();
-      blobs.forEach((b, k) => { const key = Math.floor(b[0] / cell) * 65536 + Math.floor(b[1] / cell); if (!grid.has(key)) grid.set(key, []); grid.get(key).push(k); });
+      const L = (LAT[p] ||= IC.lattice(p)), spacing = p * scale, cell = Math.max(4, spacing), grid = gridOf(blobs, cell);
       const vc = voidCentre(blobs, E, spacing);
       for (const mirror of mirrors) {
         const H0 = startH(E, mirror, false);
@@ -353,34 +396,82 @@
         if (reg) tried.push({ p, L, spacing, mirror, ...reg });
       }
     }
-    tried.sort((a, b) => b.matched - a.matched);
-    for (const t of tried.slice(0, 3)) {
-      const syms = beadColours(frame, W, H, t.L, t.M, t.spacing);
-      // The lattice looks the same turned 180°; only the data can tell.
-      for (const flip of [false, true]) {
-        const res = IC.decodeSyms(flip ? rotate180(syms, t.L) : syms, t.p);
-        if (res.ok) return { ...res, pitch: t.p, matched: t.matched };
-      }
+    return tried.sort((a, b) => b.matched - a.matched);
+  }
+  // Decode bead colours; the lattice looks the same turned 180°, so only the data can tell.
+  function decodeRGB(rgb, L, p) {
+    const syms = classify(rgb, L.length);
+    for (const flip of [false, true]) {
+      const res = IC.decodeSyms(flip ? rotate180(syms, L) : syms, p);
+      if (res.ok) return res;
     }
     return null;
   }
-  // Symbols of the same lattice read with the oval turned half a turn.
-  function rotate180(syms, L) {
-    const out = new Array(syms.length), start = [];
+  function imageRead(frame, W, H, E, { pitches = [7], mirrors = [false] } = {}) {
+    for (const t of registerAll(frame, W, H, E, pitches, mirrors).slice(0, 3)) {
+      const res = decodeRGB(beadRGB(frame, W, H, t.L, t.M, t.spacing / t.p), t.L, t.p);
+      if (res) return { ...res, pitch: t.p, matched: t.matched };
+    }
+    return null;
+  }
+  // Index of the bead half a turn round from each bead.
+  function turn180(L) {
+    if (L._r180) return L._r180;
+    const start = [];
     L.forEach((s, i) => { if (s.i === 0) start[s.ring] = i; });
-    L.forEach((s, i) => { out[i] = syms[start[s.ring] + ((s.i + s.N / 2) % s.N)]; });
-    return out;
+    return (L._r180 = L.map((s) => start[s.ring] + ((s.i + s.N / 2) % s.N)));
+  }
+  function rotate180(syms, L) { const r = turn180(L); return r.map((j) => syms[j]); }
+  // Averages bead colours over frames: noise and compression change from frame
+  // to frame, the code does not, so holding the phone still sharpens the read.
+  function imageAverager() {
+    const acc = new Map();
+    let last = null;
+    return {
+      reset() { acc.clear(); last = null; },
+      add(frame, W, H, E, pitches, mirrors) {
+        const t = (last && track(frame, W, H, E, last)) || registerAll(frame, W, H, E, pitches, mirrors)[0];
+        last = t ? { ...t, E, ref: t.ref ?? t.matched } : null;
+        if (!t) return null;
+        let rgb = beadRGB(frame, W, H, t.L, t.M, t.spacing / t.p);
+        const one = decodeRGB(rgb, t.L, t.p);
+        if (one) return { ...one, pitch: t.p, matched: t.matched, frames: 1 };
+        const key = t.p + (t.mirror ? 'm' : ''), n = t.L.length;
+        let a = acc.get(key);
+        if (!a) acc.set(key, (a = { sum: new Float32Array(n * 3), w: 0, frames: 0 }));
+        if (a.w) {
+          // This frame may have locked on half a turn round; line it up with the average.
+          const r = turn180(t.L);
+          let same = 0, turned = 0;
+          for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) {
+            const m = a.sum[i * 3 + k] / a.w;
+            same += (rgb[i * 3 + k] - m) ** 2; turned += (rgb[r[i] * 3 + k] - m) ** 2;
+          }
+          if (turned < same) { const o = new Float32Array(n * 3); for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) o[i * 3 + k] = rgb[r[i] * 3 + k]; rgb = o; }
+        }
+        // Older frames fade, so one bad frame cannot hold the average back for long.
+        for (let i = 0; i < n * 3; i++) a.sum[i] = a.sum[i] * 0.85 + rgb[i] * t.matched;
+        a.w = a.w * 0.85 + t.matched; a.frames++;
+        if (a.frames < 2) return null;
+        const mean = new Float32Array(n * 3);
+        for (let i = 0; i < n * 3; i++) mean[i] = a.sum[i] / a.w;
+        const res = decodeRGB(mean, t.L, t.p);
+        return res ? { ...res, pitch: t.p, matched: t.matched, frames: a.frames } : null;
+      },
+    };
   }
 
   // ---------- a scanning session ----------
   // Feed frames; it keeps votes while the code holds still and reports once sure.
   function session() {
-    let acc = null, last = null, n = 0;
+    let acc = null, last = null, n = 0, gone = 0;
+    const avg = imageAverager();
     return {
-      reset() { acc = null; last = null; n = 0; },
+      reset() { acc = null; last = null; n = 0; avg.reset(); },
       frame(frame, W, H, { tryImage = false, pitches = [7], mirrors = [false], steady = 0 } = {}) {
         const E = detect(frame, W, H);
-        if (!E) { acc = null; last = null; return { found: false }; }
+        if (!E) { acc = null; last = null; if (++gone > 8) avg.reset(); return { found: false }; }
+        gone = 0;
         const moved = last && (Math.hypot(E.cx - last.cx, E.cy - last.cy) > E.a * 0.06 || Math.abs(E.a - last.a) > E.a * 0.06);
         if (!acc || moved) { acc = [Array.from({ length: 48 }, () => [0, 0, 0]), Array.from({ length: 48 }, () => [0, 0, 0])]; n = 0; }
         last = E; n++;
@@ -391,7 +482,7 @@
           if (res.ok && res.disagreements <= 3) return { found: true, E, kind: 'link', id: res.id, frames: n };
         }
         if (tryImage && n > steady) {
-          const img = imageRead(frame, W, H, E, { pitches, mirrors });
+          const img = avg.add(frame, W, H, E, pitches, mirrors);
           if (img) return { found: true, E, kind: 'image', image: img };
         }
         return { found: true, E, frames: n };
@@ -399,5 +490,5 @@
     };
   }
 
-  window.SCAN = { detect, session, imageRead, PITCHES_ALL, hueClass, _fitH: fitH, _beadBlobs: beadBlobs, _register: register, _startH: startH, _applyH: applyH, _beadColours: beadColours, _voidCentre: voidCentre, _project: project };
+  window.SCAN = { detect, session, imageRead, PITCHES_ALL, hueClass, _fitH: fitH, _beadBlobs: beadBlobs, _register: register, _startH: startH, _applyH: applyH, _beadColours: beadColours, _beadRGB: beadRGB, _registerAll: registerAll, _voidCentre: voidCentre, _project: project };
 })();

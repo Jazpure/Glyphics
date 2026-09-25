@@ -45,20 +45,47 @@
       <div class="target" id="rTarget"></div>
       <div class="row" id="rActions"></div>
     </div>
-    <label class="file">Upload image<input id="photo" type="file" accept="image/*"></label>
+    <div class="row">
+      <label class="file">Take photo<input id="shoot" type="file" accept="image/*" capture="environment"></label>
+      <label class="file">Upload image<input id="photo" type="file" accept="image/*"></label>
+    </div>
   </div>
 
-  <script src="../sketches/lib.js?v=20260925d"></script>
-  <script src="../sketches/kit.js?v=20260925d"></script>
-  <script src="../sketches/r8/code.js?v=20260925d"></script>
-  <script src="../app/rs.js?v=20260925d"></script>
-  <script src="../app/imagecode.js?v=20260925d"></script>
-  <script src="scan.js?v=20260925d"></script>
+  <script src="../sketches/lib.js?v=20260925e"></script>
+  <script src="../sketches/kit.js?v=20260925e"></script>
+  <script src="../sketches/r8/code.js?v=20260925e"></script>
+  <script src="../app/rs.js?v=20260925e"></script>
+  <script src="../app/imagecode.js?v=20260925e"></script>
+  <script src="scan.js?v=20260925e"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const video = $('video'), overlay = $('overlay'), grab = document.createElement('canvas'), gx = grab.getContext('2d', { willReadFrequently: true });
-    const sess = SCAN.session(), KEY = 'glyphics.registry.v1';
-    let running = false, frameNo = 0, remote = null, done = false;
+    const KEY = 'glyphics.registry.v1';
+    let running = false, remote = null, done = false, busy = false;
+
+    // Reading runs in a worker so the camera view stays smooth.
+    const reader = (() => {
+      const waiting = new Map(); let seq = 0, w = null;
+      try {
+        w = new Worker('worker.js' + (document.querySelector('script[src^="scan.js"]').src.match(/\?.*$/) || [''])[0]);
+        w.onmessage = ({ data }) => { const f = waiting.get(data.id); waiting.delete(data.id); if (f) f(data.r); };
+        w.onerror = () => { w = null; waiting.forEach((f) => f({ found: false })); waiting.clear(); };
+      } catch { w = null; }
+      const here = SCAN.session();
+      return {
+        read(px, W, H, msg) {
+          if (!w) return Promise.resolve(msg.photo ? readHere(px, W, H) : here.frame(new Uint8ClampedArray(px), W, H, msg.opts));
+          const id = ++seq;
+          return new Promise((res) => { waiting.set(id, res); w.postMessage({ id, px, W, H, ...msg }, [px]); });
+        },
+        reset() { here.reset(); if (w) w.postMessage({ reset: true }); },
+      };
+      function readHere(buf, W, H) {
+        const px = new Uint8ClampedArray(buf), one = SCAN.session(); let r = null;
+        for (let k = 0; k < 3 && !(r && r.kind); k++) r = one.frame(px, W, H, { tryImage: k === 0, pitches: [7, 10, 8, 9], mirrors: [false, true], steady: 0 });
+        return r;
+      }
+    })();
     const say = (t) => { $('status').textContent = t; };
 
     const lookup = async (id) => {
@@ -93,7 +120,7 @@
           const img = new Image(); img.src = e.image; img.alt = e.name || 'Shared image'; target.append(img);
         } else target.textContent = 'Not available';
       }
-      actions.append(button('Scan again', () => { done = false; sess.reset(); $('result').classList.remove('on'); drawOverlay(null); if (running) video.play(); else start(); }, true));
+      actions.append(button('Scan again', () => { done = false; reader.reset(); $('result').classList.remove('on'); drawOverlay(null); if (running) video.play(); else start(); }, true));
       $('result').classList.add('on');
       $('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       say('');
@@ -164,28 +191,32 @@
       x.beginPath(); x.ellipse(ox + E.cx * s, oy + E.cy * s, E.a * s, E.b * s, E.theta, 0, Math.PI * 2); x.stroke();
     }
 
+    // Frames go to the reader at up to 2560 px on the long side (sharp enough for
+    // the densest codes, light enough to read quickly).
     function tick() {
       if (!running) return;
-      if (!done && video.readyState >= 2 && video.videoWidth) {
-        const W = video.videoWidth, H = video.videoHeight;
-        if (grab.width !== W) { grab.width = W; grab.height = H; }
+      if (!done && !busy && video.readyState >= 2 && video.videoWidth) {
+        const k = Math.min(1, 2560 / Math.max(video.videoWidth, video.videoHeight)), W = Math.round(video.videoWidth * k), H = Math.round(video.videoHeight * k);
+        if (grab.width !== W || grab.height !== H) { grab.width = W; grab.height = H; }
         gx.drawImage(video, 0, 0, W, H);
-        const px = gx.getImageData(0, 0, W, H).data;
-        frameNo++;
-        // Image codes are heavier to read: try once the code has been held still for a few frames.
-        const r = sess.frame(px, W, H, { tryImage: frameNo % 2 === 0, pitches: [7, 10], steady: 3 });
-        drawOverlay(r.E, W, H, !!r.kind);
-        if (r.kind) show(r); else say(r.found ? 'Reading…' : '');
+        busy = true;
+        reader.read(gx.getImageData(0, 0, W, H).data.buffer, W, H, { opts: { tryImage: true, pitches: [7, 10], steady: 1 } }).then((r) => {
+          busy = false;
+          if (done || !running) return;
+          drawOverlay(r.E, W, H, !!r.kind);
+          if (r.kind) show(r); else if (r.found) say('Reading…'); else if ($('status').textContent === 'Reading…') say('');
+        });
       }
-      setTimeout(() => requestAnimationFrame(tick), 60);
+      requestAnimationFrame(tick);
     }
 
     async function start() {
+      if (running) return;
       $('start').style.display = 'none';
       try {
         let stream;
         if (new URLSearchParams(location.search).has('test')) stream = await testStream();
-        else stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+        else stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } }, audio: false });
         video.srcObject = stream; await video.play();
         running = true; tick();
       } catch (err) {
@@ -204,28 +235,31 @@
       const st = video.srcObject; if (st) st.getTracks().forEach((t) => t.stop());
       video.srcObject = null; drawOverlay(null); $('start').style.display = 'grid';
     }
-    $('photo').closest('label').addEventListener('click', stopCamera);
-
+    for (const id of ['shoot', 'photo']) {
+      $(id).closest('label').addEventListener('click', stopCamera);
+      $(id).addEventListener('change', (e) => readPhoto(e.target));
+    }
     // A photo or screenshot, at up to 3000 px so small beads keep their detail.
-    $('photo').addEventListener('change', (e) => {
-      const f = e.target.files[0]; if (!f) return;
-      e.target.value = ''; // the same photo can be chosen again
+    // If nothing is chosen or nothing reads, live scanning carries on.
+    function readPhoto(input) {
+      const f = input.files[0];
+      input.value = ''; // the same photo can be chosen again
+      if (!f) { start(); return; }
       done = false; $('result').classList.remove('on'); say('Reading…');
       const url = URL.createObjectURL(f), img = new Image();
-      img.onerror = () => { URL.revokeObjectURL(url); say('Couldn’t open photo'); };
-      img.onload = () => setTimeout(() => {
-        try {
-          const s = Math.min(1, 3000 / Math.max(img.width, img.height)), W = Math.round(img.width * s), H = Math.round(img.height * s);
-          const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, W, H);
-          const px = x.getImageData(0, 0, W, H).data, one = SCAN.session();
-          let r = null;
-          for (let k = 0; k < 3 && !(r && r.kind); k++) r = one.frame(px, W, H, { tryImage: k === 0, pitches: [7, 10, 8, 9], mirrors: [false, true], steady: 0 });
-          if (r && r.kind) show(r); else say(r && r.found ? 'Couldn’t read' : 'No code found');
-        } catch { say('Couldn’t read'); }
+      img.onerror = () => { URL.revokeObjectURL(url); say('Couldn’t open photo'); start(); };
+      img.onload = () => {
+        const s = Math.min(1, 3000 / Math.max(img.width, img.height)), W = Math.round(img.width * s), H = Math.round(img.height * s);
+        const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, W, H);
         URL.revokeObjectURL(url);
-      }, 30); // let "Reading…" appear first
+        reader.read(x.getImageData(0, 0, W, H).data.buffer, W, H, { photo: true }).then((r) => {
+          if (r && r.kind) { show(r); return; }
+          say(r && r.found ? 'Couldn’t read' : 'No code found');
+          start();
+        });
+      };
       img.src = url;
-    });
+    }
 
     // Test mode (?test): a simulated camera showing a code that drifts, turns and tilts.
     async function testStream() {
